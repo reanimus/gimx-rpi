@@ -46,7 +46,7 @@ GIMX is pinned to `e44a1cc9823939165d3d92418e9d679c66496ee1` and its submodule
 commits. Apt dependencies are resolved from Ubuntu's repositories at installation
 time, so package versions can change. See the generated manifest and guest
 `/var/log/gimx/build-manifest.txt`. Compile fixes are in `payload/gimx-install`.
-The builder includes all four patches, all three authentication modes, and the
+The builder includes all eight patches, all three authentication modes, and the
 UDP status client. The [Pi 4 pairing image](companion/README.md#rebuild) has its own builder.
 
 ## Flash and boot

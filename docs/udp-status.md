@@ -123,3 +123,78 @@ versions, legacy input/query compatibility, and avoiding output on status querie
 Nine Python tests cover decoding, errors, USB donor flags, and real loopback UDP replies/timeouts.
 An end-to-end test against the installed GIMX binary also verifies the unsupported
 remote-transport status reply and legacy UDP query/input compatibility.
+
+## Disconnect logs
+
+The current build always writes timestamped connection events to stderr; no
+USB authentication trace option is required. The existing launch commands show
+them directly. To retain them, append `2>&1 | tee gimx-session.log` to your command.
+
+Example (illustrative timestamp):
+
+```text
+[2026-11-14T18:00:00.123Z] GIMX connection: PS4 disconnected controller=0 channel=control reason=channel_closed errno=0
+```
+
+Events distinguish PS4 and Bluetooth DS4 channel closure, a pending PS4 connection
+failure, USB/software authentication backend failure, and a local session stop.
+Deliberate channel cleanup does not produce misleading disconnect events.
+`controller` is the zero-based GIMX slot. Timestamps use UTC.
+
+`channel_closed` does not identify why the Bluetooth link was lost: the callback
+has no HCI reason. `errno=0` means no error code was supplied. Backend failures
+include the operation and error code when available; a dead USB worker alone
+cannot distinguish an unplugged donor from a worker failure. These events do
+not prove console authentication acceptance and do not add automatic reconnect.
+The UDP status protocol is unchanged; GIMX may exit before another status query.
+
+Successful PS4 and Bluetooth DS4 connections emit `connected` once both HID
+channels are established. Pending or partial connections do not produce it.
+After a successful full write of an AUTH2 response or RSA response page,
+GIMX emits `PS4 auth sent`, with `reason=auth2_reply` or `rsa_response_page`.
+This is a per-response transmission event, not a claim that the whole exchange
+has completed or that the console accepted it. Connecting alone does not emit
+it. Dropped replies and failed/short writes do not emit it. Deliberately corrupted
+AUTH2 replies use `reason=auth2_reply_fault_corrupted`.
+
+Hardware fault tests showed inputs eventually stopped registering without an
+explicit error or transport disconnect in either the corrupt or ignored-reply
+case. Accordingly, status reports what we know: connected and auth sent. These
+observations do not establish that every possible protocol rejection is silent.
+
+## Authentication fault experiment
+
+Append one of these flags to your existing `sudo gimx-ps4 run ...` command:
+
+- `--auth-observe`: baseline; log received PS4 control metadata without mutation.
+- `--auth-fault-corrupt`: flip one bit in each outbound AUTH2 SHA1 digest
+  (Bluetooth feature report `04`), then recompute the CRC. Framing, sequence,
+  slot and salt remain intact.
+- `--auth-fault-ignore`: drop each outbound AUTH2 report `04` reply completely.
+  The incoming challenge is still processed; its SET_REPORT handshake is not
+  dropped. This tests missing responses, not a malformed response.
+
+Fault modes are mutually exclusive and enable observation automatically. They
+work with Bluetooth, USB and software donors. They do not change RSA F0/F1/F2
+messages, pairing data, keys or the AUTH2 table. No flag means no fault injection;
+the launcher clears inherited experiment environment settings on each run.
+For direct `gimx` invocation use `sudo env GIMX_DS4_AUTH_FAULT=corrupt gimx ...`
+or `ignore`, or `GIMX_DS4_AUTH_OBSERVE=1` for the baseline.
+
+Run three fresh sessions using the same working mode and console state. Capture
+stderr with `2>&1 | tee baseline.log` (then `corrupt.log` and `ignore.log`). Keep
+each running until disconnection or at least as long as the baseline observation
+window, and record when on-screen input stops working. Confirm an `AUTH fault`
+line actually appears: enabling the flag alone does not prove injection occurred.
+Logs include timestamped fault counts, incoming request header/report/length,
+HID handshake status if received, and existing disconnect events. No report
+payloads or keys are printed. A received HID handshake is logged as such, never
+labelled PS4 authentication acceptance/rejection without further evidence.
+
+A repeatable negative response can establish a rejection indicator. Its absence
+only establishes that no such rejection was observed during that interval; it
+does not prove acceptance. In particular, the console may silently ignore an
+invalid reply, retry, or stop accepting input without closing the link. Compare
+both fault modes and the baseline before defining a timeout-based heuristic.
+These flags were tested with simulated transport and compiled in QEMU; actual
+PS4 behavior must be measured on hardware.

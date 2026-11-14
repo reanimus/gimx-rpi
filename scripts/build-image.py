@@ -56,6 +56,14 @@ def cloud_config(password_hash, ssh_key=None):
                   'owner': 'root:root', 'content': (ROOT / 'patches/gimx-ds4-auth2.patch').read_text()})
     files.append({'path': '/usr/local/share/gimx/patches/gimx-ds4-software-auth.patch', 'permissions': '0644',
                   'owner': 'root:root', 'content': (ROOT / 'patches/gimx-ds4-software-auth.patch').read_text()})
+    files.append({'path': '/usr/local/share/gimx/patches/gimx-disconnect-logging.patch', 'permissions': '0644',
+                  'owner': 'root:root', 'content': (ROOT / 'patches/gimx-disconnect-logging.patch').read_text()})
+    files.append({'path': '/usr/local/share/gimx/patches/gimx-connection-logging.patch', 'permissions': '0644',
+                  'owner': 'root:root', 'content': (ROOT / 'patches/gimx-connection-logging.patch').read_text()})
+    files.append({'path': '/usr/local/share/gimx/patches/gimx-auth-fault.patch', 'permissions': '0644',
+                  'owner': 'root:root', 'content': (ROOT / 'patches/gimx-auth-fault.patch').read_text()})
+    files.append({'path': '/usr/local/share/gimx/patches/gimx-auth-sent.patch', 'permissions': '0644',
+                  'owner': 'root:root', 'content': (ROOT / 'patches/gimx-auth-sent.patch').read_text()})
     files.append({'path': '/usr/local/share/gimx/gimx_status.py', 'permissions': '0644',
                   'owner': 'root:root', 'content': (ROOT / 'payload/gimx_status.py').read_text()})
     files.append({'path': '/usr/local/share/gimx/LICENSE', 'permissions': '0644',
@@ -126,6 +134,10 @@ def main():
                 'usb_auth_patch_sha256': digest(ROOT / 'patches/gimx-ds4-usb-auth.patch'),
                 'auth2_patch_sha256': digest(ROOT / 'patches/gimx-ds4-auth2.patch'),
                 'software_auth_patch_sha256': digest(ROOT / 'patches/gimx-ds4-software-auth.patch'),
+                'disconnect_patch_sha256': digest(ROOT / 'patches/gimx-disconnect-logging.patch'),
+                'connection_patch_sha256': digest(ROOT / 'patches/gimx-connection-logging.patch'),
+                'auth_fault_patch_sha256': digest(ROOT / 'patches/gimx-auth-fault.patch'),
+                'auth_sent_patch_sha256': digest(ROOT / 'patches/gimx-auth-sent.patch'),
                 'provisioning': 'Online first-boot build; not precompiled',
                 'validation': 'Checksum and FAT cloud-init readback; no hardware boot test'}
     a.output.with_suffix('.manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')

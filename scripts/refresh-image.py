@@ -26,6 +26,10 @@ manifest['status_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-udp-st
 manifest['usb_auth_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-ds4-usb-auth.patch')
 manifest['auth2_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-ds4-auth2.patch')
 manifest['software_auth_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-ds4-software-auth.patch')
+manifest['disconnect_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-disconnect-logging.patch')
+manifest['connection_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-connection-logging.patch')
+manifest['auth_fault_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-auth-fault.patch')
+manifest['auth_sent_patch_sha256'] = build.digest(build.ROOT / 'patches/gimx-auth-sent.patch')
 manifest['payload_sha256'] = {s.name: build.digest(s) for s in (build.ROOT / 'payload').iterdir() if s.is_file()}
 manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
 print('Refreshed image and checksum; credentials preserved')

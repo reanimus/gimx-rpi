@@ -25,31 +25,65 @@ patch=/usr/local/share/gimx/patches/gimx-udp-status-v1.patch
 usb_patch=/usr/local/share/gimx/patches/gimx-ds4-usb-auth.patch
 auth2_patch=/usr/local/share/gimx/patches/gimx-ds4-auth2.patch
 software_patch=/usr/local/share/gimx/patches/gimx-ds4-software-auth.patch
-# The USB extension builds on the status patch, changing some of its context.
-if git apply --reverse --check "$software_patch" 2>/dev/null; then
-  echo 'All authentication mode patches already applied'
-elif git apply --reverse --check "$auth2_patch" 2>/dev/null; then
-  echo 'UDP status, USB authentication and AUTH2 patches already applied'
-elif git apply --reverse --check "$usb_patch" 2>/dev/null; then
-  echo 'UDP status and USB authentication patches already applied'
+sent_patch=/usr/local/share/gimx/patches/gimx-auth-sent.patch
+fault_patch=/usr/local/share/gimx/patches/gimx-auth-fault.patch
+connection_patch=/usr/local/share/gimx/patches/gimx-connection-logging.patch
+disconnect_patch=/usr/local/share/gimx/patches/gimx-disconnect-logging.patch
+if git apply --reverse --check "$sent_patch" 2>/dev/null; then
+  echo 'All authentication and status patches already applied'
 else
-  if git apply --check "$patch" 2>/dev/null; then
-    git apply "$patch"
-  elif git apply --reverse --check "$patch" 2>/dev/null; then
-    echo 'UDP status patch already applied'
+  fault_patch=/usr/local/share/gimx/patches/gimx-auth-fault.patch
+  connection_patch=/usr/local/share/gimx/patches/gimx-connection-logging.patch
+  disconnect_patch=/usr/local/share/gimx/patches/gimx-disconnect-logging.patch
+  if git apply --reverse --check "$fault_patch" 2>/dev/null; then
+    echo 'Authentication, logging and fault injection patches already applied'
   else
-    echo 'UDP status patch does not match this source tree'; exit 1
+    connection_patch=/usr/local/share/gimx/patches/gimx-connection-logging.patch
+    disconnect_patch=/usr/local/share/gimx/patches/gimx-disconnect-logging.patch
+    if git apply --reverse --check "$connection_patch" 2>/dev/null; then
+      echo 'Authentication and connection logging patches already applied'
+    else
+      disconnect_patch=/usr/local/share/gimx/patches/gimx-disconnect-logging.patch
+      if git apply --reverse --check "$disconnect_patch" 2>/dev/null; then
+        echo 'Authentication and disconnect logging patches already applied'
+      else
+        # The USB extension builds on the status patch, changing some of its context.
+        if git apply --reverse --check "$software_patch" 2>/dev/null; then
+          echo 'All authentication mode patches already applied'
+        elif git apply --reverse --check "$auth2_patch" 2>/dev/null; then
+          echo 'UDP status, USB authentication and AUTH2 patches already applied'
+        elif git apply --reverse --check "$usb_patch" 2>/dev/null; then
+          echo 'UDP status and USB authentication patches already applied'
+        else
+          if git apply --check "$patch" 2>/dev/null; then
+            git apply "$patch"
+          elif git apply --reverse --check "$patch" 2>/dev/null; then
+            echo 'UDP status patch already applied'
+          else
+            echo 'UDP status patch does not match this source tree'; exit 1
+          fi
+          git apply --check "$usb_patch"
+          git apply "$usb_patch"
+        fi
+        if ! git apply --reverse --check "$software_patch" 2>/dev/null; then
+          if ! git apply --reverse --check "$auth2_patch" 2>/dev/null; then
+            git apply --check "$auth2_patch"
+            git apply "$auth2_patch"
+          fi
+          git apply --check "$software_patch"
+          git apply "$software_patch"
+        fi
+        git apply --check "$disconnect_patch"
+        git apply "$disconnect_patch"
+      fi
+      git apply --check "$connection_patch"
+      git apply "$connection_patch"
+    fi
+    git apply --check "$fault_patch"
+    git apply "$fault_patch"
   fi
-  git apply --check "$usb_patch"
-  git apply "$usb_patch"
-fi
-if ! git apply --reverse --check "$software_patch" 2>/dev/null; then
-  if ! git apply --reverse --check "$auth2_patch" 2>/dev/null; then
-    git apply --check "$auth2_patch"
-    git apply "$auth2_patch"
-  fi
-  git apply --check "$software_patch"
-  git apply "$software_patch"
+  git apply --check "$sent_patch"
+  git apply "$sent_patch"
 fi
 # Preserve upstream flags such as -fPIC and -DUHID. GCC now defaults to a
 # newer C dialect; this old source expects GNU C11 and common symbols.
@@ -99,7 +133,7 @@ done
   date -Is
   uname -a
   git rev-parse HEAD
-  sha256sum "$patch" "$usb_patch" "$auth2_patch" "$software_patch"
+  sha256sum "$patch" "$usb_patch" "$auth2_patch" "$software_patch" "$disconnect_patch" "$connection_patch" "$fault_patch" "$sent_patch"
   git submodule status --recursive
   dpkg-query -W bluez gcc libbluetooth-dev libxml2-dev
 } > /var/log/gimx/build-manifest.txt

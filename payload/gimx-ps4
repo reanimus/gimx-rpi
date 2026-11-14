@@ -89,9 +89,13 @@ def main():
                    help='Log local authentication metadata, never keys or payloads')
     p.add_argument('--auth2-table', metavar='PATH', help='Controller-extracted table, required for USB/software modes')
     p.add_argument('--auth-keys', metavar='DIRECTORY', help='Software mode: directory containing key.pem, serial.txt and sig.bin')
+    faults = p.add_mutually_exclusive_group()
+    faults.add_argument('--auth-fault-corrupt', action='store_true', help='TEST ONLY: corrupt every outgoing AUTH2 digest, retaining a valid CRC')
+    faults.add_argument('--auth-fault-ignore', action='store_true', help='TEST ONLY: drop every outgoing AUTH2 reply (report 04)')
+    p.add_argument('--auth-observe', action='store_true', help='Log PS4 control metadata for a baseline/fault comparison; no payloads')
     a = p.parse_args()
     mode = a.auth_mode or ('usb' if a.usb_auth is not None else 'bluetooth')
-    if any((a.auth_mode, a.usb_auth, a.usb_device, a.auth_trace, a.auth2_table, a.auth_keys)) and a.action != 'run':
+    if any((a.auth_mode, a.usb_auth, a.usb_device, a.auth_trace, a.auth2_table, a.auth_keys, a.auth_fault_corrupt, a.auth_fault_ignore, a.auth_observe)) and a.action != 'run':
         p.error('Authentication options apply to run only; keep the existing pairing configuration')
     if (a.usb_auth is not None or a.usb_device) and mode != 'usb':
         p.error('USB donor options require --auth-mode usb')
@@ -141,8 +145,16 @@ def main():
         raise ValueError('GIMX build is not ready; inspect /var/log/gimx/install.log')
     # An old GIMX binary silently ignores environment variables: require the
     # installer marker as well as install.ready before using this extension.
-    for name in ('GIMX_DS4_USB', 'GIMX_DS4_USB_TRACE', 'GIMX_DS4_AUTH2_TABLE', 'GIMX_DS4_KEYS'):
+    for name in ('GIMX_DS4_USB', 'GIMX_DS4_USB_TRACE', 'GIMX_DS4_AUTH2_TABLE', 'GIMX_DS4_KEYS', 'GIMX_DS4_AUTH_FAULT', 'GIMX_DS4_AUTH_OBSERVE'):
         os.environ.pop(name, None)
+    if a.auth_fault_corrupt or a.auth_fault_ignore or a.auth_observe:
+        # Refuse an old binary that would silently ignore the experimental flags.
+        binary = Path('/usr/local/bin/gimx')
+        if b'GIMX_DS4_AUTH_FAULT' not in binary.read_bytes():
+            raise ValueError('Installed GIMX lacks authentication fault injection support')
+        os.environ['GIMX_DS4_AUTH_OBSERVE'] = '1'
+        if a.auth_fault_corrupt or a.auth_fault_ignore:
+            os.environ['GIMX_DS4_AUTH_FAULT'] = 'corrupt' if a.auth_fault_corrupt else 'ignore'
     if mode != 'bluetooth':
         if not Path('/var/lib/gimx/auth-modes.ready').exists():
             raise ValueError('Authentication modes extension is not installed; run the authentication update installer')

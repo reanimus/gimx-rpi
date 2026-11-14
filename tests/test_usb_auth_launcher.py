@@ -49,6 +49,26 @@ class LauncherTests(unittest.TestCase):
         self.write('/var/lib/gimx/auth-modes.ready', '')
         return patch.object(launcher, 'validate_table', return_value='/private/table.bin')
 
+    def test_fault_flags_and_baseline(self):
+        self.write('/usr/local/bin/gimx', 'GIMX_DS4_AUTH_FAULT')
+        self.start('--auth-fault-corrupt')
+        self.assertEqual(os.environ['GIMX_DS4_AUTH_FAULT'], 'corrupt')
+        self.start('--auth-fault-ignore')
+        self.assertEqual(os.environ['GIMX_DS4_AUTH_FAULT'], 'ignore')
+        self.start('--auth-observe')
+        self.assertNotIn('GIMX_DS4_AUTH_FAULT', os.environ)
+        self.assertEqual(os.environ['GIMX_DS4_AUTH_OBSERVE'], '1')
+        self.start()
+        self.assertNotIn('GIMX_DS4_AUTH_OBSERVE', os.environ)
+
+    def test_fault_flags_reject_old_binary_and_conflicts(self):
+        self.write('/usr/local/bin/gimx', 'old binary')
+        with self.assertRaisesRegex(ValueError, 'lacks authentication fault'):
+            self.start('--auth-fault-corrupt')
+        with self.assertRaises(SystemExit):
+            self.start('--auth-fault-corrupt', '--auth-fault-ignore')
+        self.execute.assert_not_called()
+
     def test_old_binary_cannot_silently_ignore_local_mode(self):
         with self.assertRaisesRegex(ValueError, 'extension is not installed'):
             self.start('--usb-auth', '/dev/hidraw0', '--auth2-table', '/private/table.bin')
