@@ -1,0 +1,22 @@
+[Unit]
+Description=Experimental GIMX EMUPS4PAIRING USB gadget
+After=systemd-modules-load.service local-fs.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/start-pairing
+Restart=on-failure
+RestartSec=5
+StateDirectory=gimx-pairing
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/gimx-pairing
+PrivateTmp=true
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

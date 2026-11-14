@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+dist/
+*.img
+*.img.xz
+*.credentials.txt
+.vm/
+.firecrawl/
+# Controller-extracted AUTH2 material is not redistributable.
+auth2.bin
+private-auth2/
+private-auth/
+key.pem
+serial.txt
+sig.bin
+
+companion/pairing-gadget
+companion/pairing-gadget-static

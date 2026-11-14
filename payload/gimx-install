@@ -1,0 +1,111 @@
+#!/bin/bash
+set -Eeuo pipefail
+[[ $EUID == 0 ]] || { echo 'Run with sudo'; exit 1; }
+mkdir -p /var/log/gimx /var/lib/gimx
+exec > >(tee -a /var/log/gimx/install.log) 2>&1
+trap 'echo "Installation FAILED at line $LINENO; retry: sudo gimx-install"; touch /var/lib/gimx/install.failed' ERR
+rm -f /var/lib/gimx/install.ready /var/lib/gimx/usb-auth.ready /var/lib/gimx/auth2.ready /var/lib/gimx/auth-modes.ready
+export DEBIAN_FRONTEND=noninteractive
+apt-get -o Acquire::Retries=3 update
+apt-get -o Acquire::Retries=3 install -y build-essential pkg-config git ca-certificates \
+ bluez rfkill usbutils libbluetooth-dev libxml2-dev libusb-1.0-0-dev \
+ libncurses-dev libmhash-dev libssl-dev libxi-dev libx11-dev python3
+# Keep firmware/UART attachment services running; only bluetoothd conflicts with GIMX.
+systemctl mask --now bluetooth.service
+if [[ -c /dev/rfkill ]]; then rfkill unblock bluetooth; fi
+src=/opt/gimx-src
+ref=e44a1cc9823939165d3d92418e9d679c66496ee1
+if [[ ! -d $src/.git ]]; then
+  git clone https://github.com/matlo/GIMX.git "$src"
+fi
+cd "$src"
+[[ $(git rev-parse HEAD) == "$ref" ]] || git checkout --detach "$ref"
+git submodule update --init --recursive
+patch=/usr/local/share/gimx/patches/gimx-udp-status-v1.patch
+usb_patch=/usr/local/share/gimx/patches/gimx-ds4-usb-auth.patch
+auth2_patch=/usr/local/share/gimx/patches/gimx-ds4-auth2.patch
+software_patch=/usr/local/share/gimx/patches/gimx-ds4-software-auth.patch
+# The USB extension builds on the status patch, changing some of its context.
+if git apply --reverse --check "$software_patch" 2>/dev/null; then
+  echo 'All authentication mode patches already applied'
+elif git apply --reverse --check "$auth2_patch" 2>/dev/null; then
+  echo 'UDP status, USB authentication and AUTH2 patches already applied'
+elif git apply --reverse --check "$usb_patch" 2>/dev/null; then
+  echo 'UDP status and USB authentication patches already applied'
+else
+  if git apply --check "$patch" 2>/dev/null; then
+    git apply "$patch"
+  elif git apply --reverse --check "$patch" 2>/dev/null; then
+    echo 'UDP status patch already applied'
+  else
+    echo 'UDP status patch does not match this source tree'; exit 1
+  fi
+  git apply --check "$usb_patch"
+  git apply "$usb_patch"
+fi
+if ! git apply --reverse --check "$software_patch" 2>/dev/null; then
+  if ! git apply --reverse --check "$auth2_patch" 2>/dev/null; then
+    git apply --check "$auth2_patch"
+    git apply "$auth2_patch"
+  fi
+  git apply --check "$software_patch"
+  git apply "$software_patch"
+fi
+# Preserve upstream flags such as -fPIC and -DUHID. GCC now defaults to a
+# newer C dialect; this old source expects GNU C11 and common symbols.
+python3 - <<'PY'
+from pathlib import Path
+for p in Path('.').rglob('Makedefs'):
+    s = p.read_text().replace('-Werror ', '')
+    if '# Ubuntu GIMX compatibility' not in s:
+        s += '\n# Ubuntu GIMX compatibility\nCFLAGS += -std=gnu11 -fcommon\n'
+    p.write_text(s)
+for name in ('core/gimx.c', 'core/config_reader.c'):
+    p = Path(name)
+    s = p.read_text()
+    if '#include <stdlib.h>' not in s:
+        p.write_text('#include <stdlib.h>\n' + s)
+p = Path('core/Makefile')
+s = p.read_text().replace('ncursesw5-config --cflags', 'pkg-config --cflags ncursesw').replace('ncursesw5-config --libs', 'pkg-config --libs ncursesw')
+s = s.replace('xml2-config --cflags', 'pkg-config --cflags libxml-2.0').replace('xml2-config --libs', 'pkg-config --libs libxml-2.0')
+p.write_text(s)
+PY
+# CLI-only build avoids the old wxWidgets GUI. Build libraries in dependency order.
+libs='gimxlog gimxtime gimxfile gimxcontroller gimxpoll gimxprio gimxusb gimxhid gimxuhid gimxinput gimxserial gimxtimer gimxgpp gimxudp'
+for lib in $libs; do
+  make -C "shared/$lib" -j2 UHID=1
+  make -C "shared/$lib" install UHID=1
+done
+make -C core -j2
+make -C utils -j2
+# Install without the upstream setuid/setgid bits; invoke explicitly through sudo.
+install -m 0755 core/gimx utils/{ds4tool,sixaddr,bdaddr,hcirevision} /usr/local/bin/
+ldconfig
+python3 - <<'PYMODULE'
+from pathlib import Path
+import shutil
+import sysconfig
+dest = Path(sysconfig.get_path('purelib'))
+dest.mkdir(parents=True, exist_ok=True)
+shutil.copyfile('/usr/local/share/gimx/gimx_status.py', dest / 'gimx_status.py')
+PYMODULE
+for binary in gimx ds4tool bdaddr; do
+  if ldd "/usr/local/bin/$binary" | grep -q 'not found'; then
+    echo "Missing runtime library for $binary"; exit 1
+  fi
+done
+/usr/local/bin/gimx --help > /var/log/gimx/gimx-help.txt 2>&1
+{
+  date -Is
+  uname -a
+  git rev-parse HEAD
+  sha256sum "$patch" "$usb_patch" "$auth2_patch" "$software_patch"
+  git submodule status --recursive
+  dpkg-query -W bluez gcc libbluetooth-dev libxml2-dev
+} > /var/log/gimx/build-manifest.txt
+rm -f /var/lib/gimx/install.failed
+touch /var/lib/gimx/install.ready
+touch /var/lib/gimx/usb-auth.ready
+touch /var/lib/gimx/auth2.ready
+touch /var/lib/gimx/auth-modes.ready
+echo 'GIMX build ready. Next: sudo gimx-bt inspect'

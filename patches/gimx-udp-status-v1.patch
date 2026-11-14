@@ -1,0 +1,151 @@
+diff --git a/core/connectors/btds4.c b/core/connectors/btds4.c
+index d8d5eca..6c7b23d 100644
+--- a/core/connectors/btds4.c
++++ b/core/connectors/btds4.c
+@@ -9,6 +9,7 @@
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <gimxtime/include/gtime.h>
+ #ifndef WIN32
+ #include "connectors/btds4.h"
+ #include "connectors/bluetooth/linux/bt_mgmt.h"
+@@ -139,6 +140,8 @@ typedef struct
+ } s_channels;
+ 
+ struct btds4_state {
++    int status_initialized;
++    gtime last_report_time;
+     struct {
+       char str[18];
+       bdaddr_t ba;
+@@ -178,6 +181,35 @@ struct btds4_process_t {
+ 
+ static struct btds4_state states[MAX_CONTROLLERS] = {};
+ 
++void btds4_get_status(int number, uint32_t *flags, uint32_t *report_age_ms)
++{
++  *flags = 0;
++  *report_age_ms = UINT32_MAX;
++  if (number < 0 || number >= MAX_CONTROLLERS || !states[number].status_initialized)
++    return;
++  const struct btds4_state *s = states + number;
++  *flags = BTDS4_STATUS_INITIALIZED;
++  if (s->sys.shutdown)
++    *flags |= BTDS4_STATUS_SHUTDOWN;
++  else
++  {
++    if (s->ps4_channels.control.id >= 0)
++      *flags |= s->ps4_channels.control.pending ? BTDS4_STATUS_PS4_CONTROL_PENDING : BTDS4_STATUS_PS4_CONTROL;
++    if (s->ps4_channels.interrupt.id >= 0)
++      *flags |= s->ps4_channels.interrupt.pending ? BTDS4_STATUS_PS4_INTERRUPT_PENDING : BTDS4_STATUS_PS4_INTERRUPT;
++    if (s->ds4_channels.control.id >= 0) *flags |= BTDS4_STATUS_DS4_CONTROL;
++    if (s->ds4_channels.interrupt.id >= 0) *flags |= BTDS4_STATUS_DS4_INTERRUPT;
++  }
++  if (s->last_report_time)
++  {
++    *flags |= BTDS4_STATUS_REPORT_SENT;
++    gtime now = gtime_gettime();
++    gtime age = now >= s->last_report_time ? (now - s->last_report_time) / 1000000ULL : 0;
++    *report_age_ms = age >= UINT32_MAX ? UINT32_MAX - 1 : (uint32_t) age;
++  }
++}
++
++
+ static int read_ds4_sdp(void * user)
+ {
+   int btds4_number = (intptr_t) user;
+@@ -878,6 +910,11 @@ int btds4_init(int btds4_number, int dongle_index, const char * bdaddr_dst)
+ {
+   struct btds4_state* state = states+btds4_number;
+ 
++  state->status_initialized = 1;
++  state->last_report_time = 0;
++  state->sys.shutdown = 0;
++  state->ps4_channels.control.pending = 0;
++  state->ps4_channels.interrupt.pending = 0;
+   state->ps4_channels.control.id = -1;
+   state->ps4_channels.interrupt.id = -1;
+   state->ps4_channels.sdp.id = -1;
+@@ -1016,6 +1053,10 @@ int btds4_send_interrupt(int btds4_number, s_report_ds4* report, int active)
+ 
+   int ret = l2cap_abs_get()->send(state->ps4_channels.interrupt.id, (unsigned char*) &state->bt_report, sizeof(state->bt_report), 0);
+ 
++  if (ret == (int) sizeof(state->bt_report))
++    state->last_report_time = gtime_gettime();
++
++
+   if(ret < 0)
+   {
+     if(errno == EAGAIN)
+diff --git a/core/connectors/btds4.h b/core/connectors/btds4.h
+index 38b2d14..c23dc13 100644
+--- a/core/connectors/btds4.h
++++ b/core/connectors/btds4.h
+@@ -10,6 +10,18 @@
+ #include <stdbool.h>
+ #include <gimxcontroller/include/ds4.h>
+ 
++/* Local UDP status extension v1. Flags are snapshots, not console acknowledgments. */
++#define BTDS4_STATUS_INITIALIZED         (1U << 0)
++#define BTDS4_STATUS_PS4_CONTROL         (1U << 1)
++#define BTDS4_STATUS_PS4_INTERRUPT       (1U << 2)
++#define BTDS4_STATUS_DS4_CONTROL         (1U << 3)
++#define BTDS4_STATUS_DS4_INTERRUPT       (1U << 4)
++#define BTDS4_STATUS_PS4_CONTROL_PENDING (1U << 5)
++#define BTDS4_STATUS_PS4_INTERRUPT_PENDING (1U << 6)
++#define BTDS4_STATUS_SHUTDOWN            (1U << 7)
++#define BTDS4_STATUS_REPORT_SENT         (1U << 8)
++void btds4_get_status(int number, uint32_t *flags, uint32_t *report_age_ms);
++
+ int btds4_init(int btds4_number, int dongle_index, const char * bdaddr_dst);
+ int btds4_listen(int btds4_number);
+ void btds4_close(int btds4_number);
+diff --git a/core/controller.c b/core/controller.c
+index d2f4843..38affc2 100644
+--- a/core/controller.c
++++ b/core/controller.c
+@@ -333,6 +333,35 @@ static int network_read_callback(void * user, const void * buf, int status, stru
+   uint8_t type = ((uint8_t *)buf)[0];
+   switch(type)
+   {
++  /* Project extension: request [2, version=1, nonce:u32be], response:
++   * [2, version=1, result, controller_type, nonce:u32be, flags:u32be, age_ms:u32be].
++   * result 0 = DS4 Bluetooth snapshot, 1 = unsupported transport, 2 = bad version.
++   * Only exact-length requests are accepted. Queries never trigger report output.
++   */
++  case 0x02:
++    {
++      if (status != 6) return 0;
++      const uint8_t *request = buf;
++      uint8_t response[16] = { 2, 1, 1, adapters[adapter].ctype };
++      uint32_t flags = 0, age = UINT32_MAX;
++      memcpy(response + 4, request + 2, 4);
++      if (request[1] != 1)
++        response[2] = 2;
++#ifndef WIN32
++      else if (adapters[adapter].atype == E_ADAPTER_TYPE_BLUETOOTH &&
++               adapters[adapter].ctype == C_TYPE_DS4)
++      {
++        response[2] = 0;
++        btds4_get_status(adapter, &flags, &age);
++      }
++#endif
++      uint32_t wire_flags = gudp_htonl(flags), wire_age = gudp_htonl(age);
++      memcpy(response + 8, &wire_flags, 4);
++      memcpy(response + 12, &wire_age, 4);
++      if (gudp_send(adapters[adapter].src_socket, response, sizeof(response), address) < 0)
++        gwarn("could not send connection status\n");
++      return 0;
++    }
+   case E_NETWORK_PACKET_CONTROLLER:
+     {
+       // send the answer
+@@ -350,6 +379,7 @@ static int network_read_callback(void * user, const void * buf, int status, stru
+     break;
+   case E_NETWORK_PACKET_IN_REPORT:
+     {
++      if ((size_t) status < sizeof(s_network_packet_in_report)) return 0;
+       s_network_packet_in_report * report = (s_network_packet_in_report *) buf;
+       if((unsigned int) status != sizeof(* report) + report->nbAxes * sizeof(* report->axes))
+       {

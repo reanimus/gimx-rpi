@@ -1,0 +1,17 @@
+#!/bin/sh
+set -eu
+model=$(tr -d '\000' < /proc/device-tree/model)
+case "$model" in
+  'Raspberry Pi 4 Model B'*) ;;
+  *) echo "This service is configured for Raspberry Pi 4 Model B, found: $model" >&2; exit 1 ;;
+esac
+modprobe raw_gadget
+# dwc2 is built into the pinned Ubuntu raspi kernel; the boot overlay selects peripheral mode.
+set -- /sys/class/udc/*
+if [ "$#" -ne 1 ] || [ ! -d "$1" ]; then
+  echo 'Expected exactly one USB device controller. Check dwc2 peripheral overlay.' >&2
+  exit 1
+fi
+udc=${1##*/}
+# Raw Gadget matches the dwc2 gadget name (the UDC device name), not the module name.
+exec /usr/local/libexec/gimx-pairing "$udc" "$udc" /var/lib/gimx-pairing

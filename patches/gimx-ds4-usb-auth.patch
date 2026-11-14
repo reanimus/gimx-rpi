@@ -1,0 +1,589 @@
+diff --git a/core/Makefile b/core/Makefile
+index e058d3e..74a2eb3 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -55,7 +55,8 @@ LDLIBS += -lpdcursesw
+ endif
+ 
+ ifneq ($(OS),Windows_NT)
+-LDLIBS += -lm -lbluetooth -lmhash
++LDLIBS += -lm -lbluetooth -lmhash -pthread
++CFLAGS += -pthread
+ else
+ LDLIBS += $(shell sdl2-config --libs) -lws2_32 -lintl
+ LDLIBS:=$(filter-out -mwindows,$(LDLIBS))
+@@ -106,4 +107,4 @@ uninstall:
+ 	-rmdir $(prefix)
+ 
+ really-clean: clean uninstall
+-endif
+\ No newline at end of file
++endif
+diff --git a/core/connectors/btds4.c b/core/connectors/btds4.c
+index 6c7b23d..e2a05d6 100644
+--- a/core/connectors/btds4.c
++++ b/core/connectors/btds4.c
+@@ -9,9 +9,12 @@
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <errno.h>
++#include <stdlib.h>
+ #include <gimxtime/include/gtime.h>
+ #ifndef WIN32
+ #include "connectors/btds4.h"
++#include "connectors/linux/usb_auth/ds4_usb_auth.h"
++#include <gimxpoll/include/gpoll.h>
+ #include "connectors/bluetooth/linux/bt_mgmt.h"
+ #include "connectors/bluetooth/bt_device_abs.h"
+ #include <mhash.h>
+@@ -140,6 +143,8 @@ typedef struct
+ } s_channels;
+ 
+ struct btds4_state {
++    struct ds4_usb_auth *usb_auth;
++    int usb_mode, usb_trace, usb_unsupported;
+     int status_initialized;
+     gtime last_report_time;
+     struct {
+@@ -189,10 +194,13 @@ void btds4_get_status(int number, uint32_t *flags, uint32_t *report_age_ms)
+     return;
+   const struct btds4_state *s = states + number;
+   *flags = BTDS4_STATUS_INITIALIZED;
++  if (s->usb_mode) *flags |= BTDS4_STATUS_USB_AUTH;
++  if (s->usb_unsupported) *flags |= BTDS4_STATUS_USB_UNSUPPORTED;
+   if (s->sys.shutdown)
+     *flags |= BTDS4_STATUS_SHUTDOWN;
+   else
+   {
++    if (s->usb_auth && ds4_usb_alive(s->usb_auth)) *flags |= BTDS4_STATUS_USB_CONNECTED;
+     if (s->ps4_channels.control.id >= 0)
+       *flags |= s->ps4_channels.control.pending ? BTDS4_STATUS_PS4_CONTROL_PENDING : BTDS4_STATUS_PS4_CONTROL;
+     if (s->ps4_channels.interrupt.id >= 0)
+@@ -299,6 +307,9 @@ static int close_ps4_sdp(void * user)
+     return 1;
+   }
+ 
++  /* USB mode does not use the donor-side Bluetooth SDP/ACL workaround. */
++  if (state->usb_mode) return 0;
++
+   /*
+    * Warning: this is really hackish...
+    * There is an issue at the very first connection.
+@@ -452,6 +463,39 @@ static int close_ds4_interrupt(void * user)
+   return 1;
+ }
+ 
++static int usb_auth_failed(void *user)
++{
++  struct btds4_state *state = states + (intptr_t)user;
++  fprintf(stderr, "USB auth transport failed; stopping this PS4 session\n");
++  state->sys.shutdown = 1;
++  return 1;
++}
++
++static int read_usb_auth(void *user)
++{
++  struct btds4_state *state = states + (intptr_t)user;
++  struct ds4_usb_reply reply;
++  if (ds4_usb_receive(state->usb_auth, &reply) < 0) {
++    if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
++    return usb_auth_failed(user);
++  }
++  if (reply.unsupported) {
++    state->usb_unsupported = 1;
++    fprintf(stderr, "USB auth: unsupported Bluetooth request header=0x%02x report=0x%02x; no USB equivalent implemented\n",
++            reply.header, reply.report);
++  }
++  if (state->usb_trace || reply.error) {
++    fprintf(stderr, "USB auth: header=0x%02x report=0x%02x response_bytes=%zu handshake=%s errno=%d\n",
++            reply.header, reply.report, reply.length,
++            reply.length == 1 ? (reply.data[0] == 0 ? "success" : "error") : "data", reply.error);
++  }
++  if (state->sys.shutdown || state->ps4_channels.control.id < 0) return 1;
++  if (l2cap_abs_get()->send(state->ps4_channels.control.id, reply.data, reply.length, 0) != (int)reply.length)
++    return usb_auth_failed(user);
++  /* USB/CRC failures end the attempt; unsupported reports remain observable. */
++  return reply.error ? usb_auth_failed(user) : 0;
++}
++
+ static int read_ps4_control(void * user)
+ {
+   int btds4_number = (intptr_t) user;
+@@ -460,76 +504,18 @@ static int read_ps4_control(void * user)
+ 
+   ssize_t len = l2cap_abs_get()->recv(states[btds4_number].ps4_channels.control.id, buf, sizeof(buf));
+ 
++  if (states[btds4_number].usb_auth) {
++    if (len <= 0 || ds4_usb_submit(states[btds4_number].usb_auth, buf, len) < 0)
++      return usb_auth_failed(user);
++    return 0;
++  }
++
+   if(len < 0)
+   {
+     fprintf(stderr, "error reading ps4 control\n");
+   }
+   else
+   {
+-    /*if(buf[1] == 0x02)
+-    {
+-      unsigned char resp02[] =
+-      {
+-          0xa3, 0x02, 0x01, 0x00, 0xff, 0xff, 0x01, 0x00, 0x5e, 0x22, 0x84, 0x22, 0x9b, 0x22, 0xa6, 0xdd,
+-          0x79, 0xdd, 0x64, 0xdd, 0x1c, 0x02, 0x1c, 0x02, 0x85, 0x1f, 0x9f, 0xe0, 0x92, 0x20, 0xdc, 0xe0,
+-          0x4d, 0x1c, 0x1e, 0xde, 0x08, 0x00
+-      };
+-
+-      if(l2cap_abs_get(E_L2CAP_BLUEZ)->send(states[btds4_number].ps4_channels.control, resp02, sizeof(resp02), 0) != sizeof(resp02))
+-      {
+-        fprintf(stderr, "error writing ps4 control\n");
+-      }
+-
+-      return 0;
+-    }
+-
+-    if(buf[1] == 0x06)
+-    {
+-      unsigned char resp06[] =
+-      {
+-        0xa3, 0x06, 0x41, 0x75, 0x67, 0x20, 0x20, 0x33, 0x20, 0x32, 0x30, 0x31, 0x33, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x30, 0x37, 0x3a, 0x30, 0x31, 0x3a, 0x31, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x01, 0x00, 0x31, 0x03, 0x00, 0x00, 0x00, 0x49, 0x00, 0x05, 0x00, 0x00, 0x80,
+-        0x03, 0x00, 0x4b, 0x52, 0x02, 0xc7
+-      };
+-
+-      if(l2cap_abs_get(E_L2CAP_BLUEZ)->send(states[btds4_number].ps4_channels.control, resp06, sizeof(resp06), 0) != sizeof(resp06))
+-      {
+-        fprintf(stderr, "error writing ps4 control\n");
+-      }
+-
+-      return 0;
+-    }
+-
+-    if(buf[1] == 0xa3)
+-    {
+-      unsigned char respa3[] =
+-      {
+-        0xa3, 0x06, 0x41, 0x75, 0x67, 0x20, 0x20, 0x33, 0x20, 0x32, 0x30, 0x31, 0x33, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x30, 0x37, 0x3a, 0x30, 0x31, 0x3a, 0x31, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+-        0x00, 0x00, 0x00, 0x01, 0x00, 0x31, 0x03, 0x00, 0x00, 0x00, 0x49, 0x00, 0x05, 0x00, 0x00, 0x80,
+-        0x03, 0x00
+-      };
+-
+-      if(l2cap_abs_get(E_L2CAP_BLUEZ)->send(states[btds4_number].ps4_channels.control, respa3, sizeof(respa3), 0) != sizeof(respa3))
+-      {
+-        fprintf(stderr, "error writing ps4 control\n");
+-      }
+-
+-      return 0;
+-    }*/
+-
+-    /*
+-     * todo: forward to USB device, and deactivate l2cap_send
+-     */
+-
+-    /*if(buf[1] == 0x03 || buf[1] == 0x04)
+-    {
+-      gtime now = gtime_gettime();
+-      ginfo("%lu.%06lu ", GTIME_SECPART(now), GTIME_USECPART(now));
+-      ginfo("report id 0x%02x\n", buf[1]);
+-    }*/
+-
+     int ret = l2cap_abs_get()->send(states[btds4_number].ds4_channels.control.id, buf, len, 0);
+ 
+     if(ret != len)
+@@ -573,6 +559,11 @@ static int connect_ps4_control(void * user)
+ 
+   state->ps4_channels.control.pending = 0;
+ 
++  if (state->usb_auth) {
++    l2cap_abs_get()->add_source(state->ps4_channels.control.id, user, read_ps4_control, process, close_ps4_control);
++    return 0;
++  }
++
+   if(state->ds4_channels.control.id >= 0)
+   {
+     l2cap_abs_get()->add_source(state->ps4_channels.control.id, user, read_ps4_control, process, close_ps4_control);
+@@ -594,7 +585,7 @@ static int read_ps4_interrupt(void * user)
+   {
+     fprintf(stderr, "error reading ps4 interrupt\n");
+   }
+-  else
++  else if (len >= 9 && !states[btds4_number].usb_mode)
+   {
+     switch(buf[1])
+     {
+@@ -725,6 +716,11 @@ static int connect_ps4_interrupt(void * user)
+ 
+   state->ps4_channels.interrupt.pending = 0;
+ 
++  if (state->usb_auth) {
++    l2cap_abs_get()->add_source(state->ps4_channels.interrupt.id, user, read_ps4_interrupt, process, close_ps4_interrupt);
++    return 0;
++  }
++
+   if(state->ds4_channels.interrupt.id >= 0)
+   {
+     l2cap_abs_get()->add_source(state->ps4_channels.interrupt.id, user, read_ps4_interrupt, process, close_ps4_interrupt);
+@@ -761,7 +757,7 @@ static int listen_accept_sdp(int channel, bdaddr_t * src)
+       /*
+        * Look for a controller that has no ds4 bdaddr.
+        */
+-      if(strchr(states[i].ps4_bdaddr, ':') && !strchr(states[i].ds4_bdaddr, ':'))
++      if(!states[i].usb_mode && strchr(states[i].ps4_bdaddr, ':') && !strchr(states[i].ds4_bdaddr, ':'))
+       {
+         ba2str(src, states[i].ds4_bdaddr);
+         states[i].ds4_channels.sdp.id = channel;
+@@ -932,6 +928,28 @@ int btds4_init(int btds4_number, int dongle_index, const char * bdaddr_dst)
+   strncpy(state->ps4_bdaddr, bdaddr_dst, sizeof(state->ps4_bdaddr) - 1);
+ 
+   memcpy(&state->bt_report, &init_report_btds4, sizeof(s_btds4_report));
++  const char *usb_path = getenv("GIMX_DS4_USB");
++  if (usb_path && *usb_path) {
++    if (gimx_params.btstack || btds4_number) {
++      fprintf(stderr, "USB auth requires BlueZ and a single controller\n");
++      return -1;
++    }
++    state->usb_mode = 1;
++    state->usb_trace = getenv("GIMX_DS4_USB_TRACE") != NULL;
++    state->joystick_id = -1;
++    state->usb_auth = ds4_usb_open(usb_path);
++    if (!state->usb_auth) { perror("open USB DS4 authentication donor"); return -1; }
++    static const GPOLL_CALLBACKS callbacks = {
++      .fp_read = read_usb_auth, .fp_close = usb_auth_failed
++    };
++    if (gpoll_register_fd(ds4_usb_fd(state->usb_auth), (void *)(intptr_t)btds4_number, &callbacks) < 0) {
++      ds4_usb_close(state->usb_auth);
++      state->usb_auth = NULL;
++      return -1;
++    }
++    fprintf(stderr, "Experimental USB auth donor: %s; Bluetooth 03/04 are unsupported\n", usb_path);
++    return 0;
++  }
+   state->joystick_id = ginput_register_joystick(DS4_DEVICE_NAME, GE_HAPTIC_RUMBLE, ds4_interrupt_rumble);
+ 
+   return 0;
+@@ -972,6 +990,22 @@ int btds4_listen(int btds4_number)
+     }
+   }
+ 
++  if (state->usb_auth) {
++    void *user = (void *)(intptr_t)btds4_number;
++    ginfo("connecting to PS4 %s with USB authentication donor\n", state->ps4_bdaddr);
++    state->ps4_channels.control.id = l2cap_abs_get()->connect(state->dongle_bdaddr.str, state->ps4_bdaddr,
++        PSM_HID_CONTROL, L2CAP_ABS_LM_MASTER | L2CAP_ABS_LM_AUTH | L2CAP_ABS_LM_ENCRYPT,
++        user, connect_ps4_control, close_ps4_control);
++    if (state->ps4_channels.control.id < 0) return -1;
++    state->ps4_channels.control.pending = 1;
++    state->ps4_channels.interrupt.id = l2cap_abs_get()->connect(state->dongle_bdaddr.str, state->ps4_bdaddr,
++        PSM_HID_INTERRUPT, L2CAP_ABS_LM_MASTER | L2CAP_ABS_LM_AUTH | L2CAP_ABS_LM_ENCRYPT,
++        user, connect_ps4_interrupt, close_ps4_interrupt);
++    if (state->ps4_channels.interrupt.id < 0) { close_ps4_control(user); return -1; }
++    state->ps4_channels.interrupt.pending = 1;
++    return 0;
++  }
++
+   if(listening_channels.hid_control < 0)
+   {
+     if((listening_channels.hid_control = l2cap_abs_get()->listen((void *)(intptr_t) btds4_number, state->dongle_bdaddr.str, PSM_HID_CONTROL, L2CAP_ABS_LM_MASTER, listen_accept_control, listen_close)) < 0)
+@@ -1002,7 +1036,12 @@ int btds4_send_interrupt(int btds4_number, s_report_ds4* report, int active)
+     return -1;
+   }
+ 
+-  if(state->ps4_channels.interrupt.id < 0 || state->ps4_channels.interrupt.pending || state->ds4_channels.interrupt.id < 0)
++  if (state->usb_mode && (!state->usb_auth || !ds4_usb_alive(state->usb_auth))) {
++    usb_auth_failed((void *)(intptr_t)btds4_number);
++    return -1;
++  }
++  if(state->ps4_channels.interrupt.id < 0 || state->ps4_channels.interrupt.pending ||
++      (!state->usb_mode && state->ds4_channels.interrupt.id < 0))
+   {
+     return 0;
+   }
+@@ -1083,9 +1122,11 @@ void btds4_close(int btds4_number)
+     l2cap_abs_get()->disconnect(state->ds4_channels.control.id);
+   }
+ 
+-  /*
+-   * todo: close any USB device that was opened!
+-   */
++  if (state->usb_auth) {
++    gpoll_remove_fd(ds4_usb_fd(state->usb_auth));
++    ds4_usb_close(state->usb_auth);
++    state->usb_auth = NULL;
++  }
+ 
+   close_ps4_sdp((void *)(intptr_t) btds4_number);
+   close_ps4_interrupt((void *)(intptr_t) btds4_number);
+diff --git a/core/connectors/btds4.h b/core/connectors/btds4.h
+index c23dc13..fe74086 100644
+--- a/core/connectors/btds4.h
++++ b/core/connectors/btds4.h
+@@ -20,6 +20,9 @@
+ #define BTDS4_STATUS_PS4_INTERRUPT_PENDING (1U << 6)
+ #define BTDS4_STATUS_SHUTDOWN            (1U << 7)
+ #define BTDS4_STATUS_REPORT_SENT         (1U << 8)
++#define BTDS4_STATUS_USB_AUTH            (1U << 9)
++#define BTDS4_STATUS_USB_CONNECTED       (1U << 10)
++#define BTDS4_STATUS_USB_UNSUPPORTED     (1U << 11)
+ void btds4_get_status(int number, uint32_t *flags, uint32_t *report_age_ms);
+ 
+ int btds4_init(int btds4_number, int dongle_index, const char * bdaddr_dst);
+diff --git a/core/connectors/linux/usb_auth/ds4_usb_auth.c b/core/connectors/linux/usb_auth/ds4_usb_auth.c
+new file mode 100644
+index 0000000..b2bf2c0
+--- /dev/null
++++ b/core/connectors/linux/usb_auth/ds4_usb_auth.c
+@@ -0,0 +1,224 @@
++/* Experimental DS4 USB donor for the Bluetooth connector. GPL-3.0-or-later.
++ * Only reports with known USB equivalents are translated. In particular,
++ * Bluetooth 03/04 MUST NOT be passed to the unrelated USB report 04.
++ */
++#include "ds4_usb_auth.h"
++#include <errno.h>
++#include <fcntl.h>
++#include <linux/hidraw.h>
++#include <linux/input.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/file.h>
++#include <sys/ioctl.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++struct ds4_usb_auth {
++  int hid, channel[2], busy;
++  pthread_t worker;
++};
++
++static uint32_t crc32(const uint8_t *data, size_t length)
++{
++  uint32_t crc = UINT32_MAX;
++  for (size_t i = 0; i < length; ++i) {
++    crc ^= data[i];
++    for (int b = 0; b < 8; ++b)
++      crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
++  }
++  return ~crc;
++}
++
++static void put_crc(uint8_t *data, size_t length)
++{
++  uint32_t crc = crc32(data, length - 4);
++  for (int i = 0; i < 4; ++i) data[length - 4 + i] = crc >> (8 * i);
++}
++
++static int valid_crc(const uint8_t *data, size_t length)
++{
++  uint32_t crc = crc32(data, length - 4);
++  for (int i = 0; i < 4; ++i)
++    if (data[length - 4 + i] != (uint8_t)(crc >> (8 * i))) return 0;
++  return 1;
++}
++
++static void handshake(struct ds4_usb_reply *reply, uint8_t status)
++{
++  reply->length = 1;
++  reply->data[0] = status;
++}
++
++/* USB calibration interleaves gyro +/- pairs; Bluetooth groups all +/- values. */
++static void calibration_to_bt(uint8_t *data)
++{
++  uint8_t gyro[12];
++  memcpy(gyro, data + 7, sizeof(gyro));
++  for (int axis = 0; axis < 3; ++axis) {
++    memcpy(data + 7 + axis * 2, gyro + axis * 4, 2);
++    memcpy(data + 13 + axis * 2, gyro + axis * 4 + 2, 2);
++  }
++}
++
++static void exchange(int hid, const uint8_t *packet, size_t length,
++                     struct ds4_usb_reply *reply)
++{
++  uint8_t usb[64] = {0};
++  size_t usb_length = 0, bt_length = 0;
++  int crc = 0;
++  memset(reply, 0, sizeof(*reply));
++  reply->header = length ? packet[0] : 0;
++  reply->report = length > 1 ? packet[1] : 0;
++  handshake(reply, 0x04); /* Invalid parameter unless a complete request matches. */
++  if (length < 2) return;
++  if (packet[0] == 0x53) {
++    if (packet[1] != 0xf0) goto unsupported;
++    if (length != 65 || !valid_crc(packet, length)) return;
++    memcpy(usb, packet + 1, sizeof(usb));
++    put_crc(usb, sizeof(usb)); /* USB excludes the HID transaction header. */
++    int ret = ioctl(hid, HIDIOCSFEATURE(sizeof(usb)), usb);
++    if (ret != (int)sizeof(usb)) {
++      reply->error = ret < 0 ? errno : EPROTO;
++      handshake(reply, 0x0e);
++    } else handshake(reply, 0x00);
++    return;
++  }
++  if (packet[0] != 0x43 && packet[0] != 0x4b) goto unsupported;
++  if (length != (packet[0] == 0x4b ? 4U : 2U)) return;
++  switch (packet[1]) {
++    case 0x02: usb[0] = 0x02; usb_length = bt_length = 37; break;
++    case 0x05: usb[0] = 0x02; usb_length = 37; bt_length = 41; crc = 1; break;
++    case 0x06: usb[0] = 0xa3; usb_length = 49; bt_length = 53; crc = 1; break;
++    case 0xa3: usb[0] = 0xa3; usb_length = bt_length = 49; break;
++    case 0xf1: usb[0] = 0xf1; usb_length = bt_length = 64; crc = 1; break;
++    case 0xf2: usb[0] = 0xf2; usb_length = bt_length = 16; crc = 1; break;
++    default: goto unsupported;
++  }
++  /* Do not advance the donor's F1 page cursor for an undersized request. */
++  if (packet[0] == 0x4b && ((unsigned)packet[2] | (unsigned)packet[3] << 8) < bt_length)
++    return;
++  uint8_t id = usb[0];
++  int ret = ioctl(hid, HIDIOCGFEATURE(usb_length), usb);
++  if (ret != (int)usb_length || usb[0] != id) {
++    reply->error = ret < 0 ? errno : EPROTO;
++    handshake(reply, 0x0e);
++    return;
++  }
++  if ((id == 0xf1 || id == 0xf2) && !valid_crc(usb, usb_length)) {
++    reply->error = EBADMSG;
++    handshake(reply, 0x0e);
++    return;
++  }
++  if (id == 0x02) calibration_to_bt(usb);
++  reply->data[0] = 0xa3;
++  memcpy(reply->data + 1, usb, usb_length);
++  reply->data[1] = packet[1];
++  reply->length = bt_length + 1;
++  if (crc) put_crc(reply->data, reply->length);
++  return;
++unsupported:
++  reply->unsupported = 1;
++  handshake(reply, 0x03);
++}
++
++static void *worker(void *arg)
++{
++  struct ds4_usb_auth *auth = arg;
++  uint8_t packet[65];
++  for (;;) {
++    ssize_t length = recv(auth->channel[1], packet, sizeof(packet), 0);
++    if (length < 0 && errno == EINTR) continue;
++    if (length <= 0) break;
++    struct ds4_usb_reply reply;
++    exchange(auth->hid, packet, length, &reply);
++    ssize_t sent;
++    do {
++      sent = send(auth->channel[1], &reply, sizeof(reply), MSG_NOSIGNAL);
++    } while (sent < 0 && errno == EINTR);
++    if (sent != (ssize_t)sizeof(reply)) break;
++  }
++  shutdown(auth->channel[1], SHUT_RDWR);
++  return NULL;
++}
++
++struct ds4_usb_auth *ds4_usb_open(const char *path)
++{
++  struct ds4_usb_auth *auth = calloc(1, sizeof(*auth));
++  if (!auth) return NULL;
++  auth->hid = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
++  auth->channel[0] = auth->channel[1] = -1;
++  if (auth->hid < 0) goto fail;
++  struct hidraw_devinfo info;
++  if (ioctl(auth->hid, HIDIOCGRAWINFO, &info) < 0) goto fail;
++  if (info.bustype != BUS_USB || (uint16_t)info.vendor != 0x054c ||
++      ((uint16_t)info.product != 0x09cc && (uint16_t)info.product != 0x05c4)) {
++    errno = ENODEV;
++    goto fail;
++  }
++  if (flock(auth->hid, LOCK_EX | LOCK_NB) < 0) goto fail;
++  if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, auth->channel) < 0) goto fail;
++  int error = pthread_create(&auth->worker, NULL, worker, auth);
++  if (error) { errno = error; goto fail; }
++  return auth;
++fail:;
++  int saved = errno;
++  if (auth->channel[0] >= 0) close(auth->channel[0]);
++  if (auth->channel[1] >= 0) close(auth->channel[1]);
++  if (auth->hid >= 0) close(auth->hid);
++  free(auth);
++  errno = saved;
++  return NULL;
++}
++
++int ds4_usb_fd(const struct ds4_usb_auth *auth) { return auth->channel[0]; }
++
++int ds4_usb_alive(const struct ds4_usb_auth *auth)
++{
++  /* Check disconnection without consuming controller input reports. */
++  struct pollfd fds[2] = {{.fd = auth->hid}, {.fd = auth->channel[0]}};
++  int ret;
++  do { ret = poll(fds, 2, 0); } while (ret < 0 && errno == EINTR);
++  return ret >= 0 && !(fds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) &&
++                     !(fds[1].revents & (POLLERR | POLLHUP | POLLNVAL));
++}
++
++int ds4_usb_submit(struct ds4_usb_auth *auth, const uint8_t *data, size_t length)
++{
++  if (auth->busy) { errno = EBUSY; return -1; }
++  if (!length || length > 65) { errno = EMSGSIZE; return -1; }
++  ssize_t sent;
++  do { sent = send(auth->channel[0], data, length, MSG_NOSIGNAL | MSG_DONTWAIT); }
++  while (sent < 0 && errno == EINTR);
++  if (sent != (ssize_t)length) return -1;
++  auth->busy = 1;
++  return 0;
++}
++
++int ds4_usb_receive(struct ds4_usb_auth *auth, struct ds4_usb_reply *reply)
++{
++  ssize_t length;
++  do { length = recv(auth->channel[0], reply, sizeof(*reply), MSG_DONTWAIT); }
++  while (length < 0 && errno == EINTR);
++  if (length < 0) return -1;
++  if (!auth->busy || length != (ssize_t)sizeof(*reply) ||
++      !reply->length || reply->length > sizeof(reply->data)) {
++    errno = EPROTO;
++    return -1;
++  }
++  auth->busy = 0;
++  return 0;
++}
++
++void ds4_usb_close(struct ds4_usb_auth *auth)
++{
++  if (!auth) return;
++  shutdown(auth->channel[0], SHUT_RDWR);
++  pthread_join(auth->worker, NULL);
++  close(auth->channel[0]);
++  close(auth->channel[1]);
++  close(auth->hid);
++  free(auth);
++}
+diff --git a/core/connectors/linux/usb_auth/ds4_usb_auth.h b/core/connectors/linux/usb_auth/ds4_usb_auth.h
+new file mode 100644
+index 0000000..9848ce6
+--- /dev/null
++++ b/core/connectors/linux/usb_auth/ds4_usb_auth.h
+@@ -0,0 +1,22 @@
++/* Experimental DS4 USB donor for the Bluetooth connector. GPL-3.0-or-later. */
++#ifndef DS4_USB_AUTH_H
++#define DS4_USB_AUTH_H
++#include <stddef.h>
++#include <stdint.h>
++
++struct ds4_usb_auth;
++struct ds4_usb_reply {
++  size_t length;
++  int error;
++  int unsupported;
++  uint8_t header, report;
++  uint8_t data[65];
++};
++struct ds4_usb_auth *ds4_usb_open(const char *path);
++int ds4_usb_fd(const struct ds4_usb_auth *auth);
++int ds4_usb_alive(const struct ds4_usb_auth *auth);
++/* One control transaction at a time; all HID feature I/O runs in a worker. */
++int ds4_usb_submit(struct ds4_usb_auth *auth, const uint8_t *data, size_t length);
++int ds4_usb_receive(struct ds4_usb_auth *auth, struct ds4_usb_reply *reply);
++void ds4_usb_close(struct ds4_usb_auth *auth);
++#endif

@@ -1,0 +1,183 @@
+diff --git a/core/connectors/linux/usb_auth/ds4_usb_auth.c b/core/connectors/linux/usb_auth/ds4_usb_auth.c
+index b2bf2c0..a0998a3 100644
+--- a/core/connectors/linux/usb_auth/ds4_usb_auth.c
++++ b/core/connectors/linux/usb_auth/ds4_usb_auth.c
+@@ -7,20 +7,84 @@
+ #include <fcntl.h>
+ #include <linux/hidraw.h>
+ #include <linux/input.h>
++#include <mhash.h>
+ #include <poll.h>
+ #include <pthread.h>
++#include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+ #include <sys/file.h>
+ #include <sys/ioctl.h>
++#include <sys/random.h>
+ #include <sys/socket.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ struct ds4_usb_auth {
+   int hid, channel[2], busy;
+   pthread_t worker;
++  int auth2_enabled, auth2_ready;
++  uint8_t table[16][32], salt[20], auth2_response[48];
+ };
+ 
++/* User-supplied controller data, not part of this source or its license.
++ * Format/hash reference: dogtopus ds40304poke.py, gist
++ * 931ba2cc911a1c13b21d1b3fd34de493 revision fe1639180f9af329db5fdbe6a695b38a27ff8607.
++ */
++static int auth2_load(struct ds4_usb_auth *auth, const char *path)
++{
++  static const uint8_t expected[32] = {
++    0x98,0xb7,0x00,0xc5,0x68,0xbd,0x40,0xd1,0xa3,0xa2,0x80,0xa6,0x39,0x18,0xc3,0x57,
++    0xb1,0x71,0x36,0x66,0xd7,0xfb,0x99,0x2a,0xb0,0x8e,0x19,0xf9,0x6b,0xa3,0x1b,0x7d
++  };
++  auth->auth2_enabled = auth->auth2_ready = 0;
++  int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
++  if (fd < 0) return -1;
++  struct stat st;
++  if (fstat(fd, &st) < 0) goto fail;
++  if (!S_ISREG(st.st_mode) || st.st_size != sizeof(auth->table)) {
++    errno = EINVAL;
++    goto fail;
++  }
++  size_t offset = 0;
++  while (offset < sizeof(auth->table)) {
++    ssize_t n = read(fd, (uint8_t *)auth->table + offset, sizeof(auth->table) - offset);
++    if (n < 0 && errno == EINTR) continue;
++    if (n <= 0) { if (n == 0) errno = EINVAL; goto fail; }
++    offset += n;
++  }
++  uint8_t extra;
++  ssize_t n;
++  do { n = read(fd, &extra, 1); } while (n < 0 && errno == EINTR);
++  if (n != 0) { if (n > 0) errno = EINVAL; goto fail; }
++  uint8_t digest[32];
++  MHASH hash = mhash_init(MHASH_SHA256);
++  if (hash == MHASH_FAILED) { errno = ENOMEM; goto fail; }
++  mhash(hash, auth->table, sizeof(auth->table));
++  mhash_deinit(hash, digest);
++  if (memcmp(digest, expected, sizeof(digest))) { errno = EBADMSG; goto fail; }
++  /* The public verifier hashes the returned 20-byte salt. We generate one per
++   * session, stable across challenges; this is not a reconstructed device-data
++   * digest. Whether the PS4 imposes further salt constraints needs hardware testing.
++   */
++  offset = 0;
++  while (offset < sizeof(auth->salt)) {
++    n = getrandom(auth->salt + offset, sizeof(auth->salt) - offset, 0);
++    if (n < 0 && errno == EINTR) continue;
++    if (n <= 0) { if (n == 0) errno = EIO; goto fail; }
++    offset += n;
++  }
++  close(fd);
++  auth->auth2_enabled = 1;
++  return 0;
++fail:;
++  int saved = errno;
++  close(fd);
++  explicit_bzero(auth->table, sizeof(auth->table));
++  errno = saved;
++  return -1;
++}
++
+ static uint32_t crc32(const uint8_t *data, size_t length)
+ {
+   uint32_t crc = UINT32_MAX;
+@@ -124,6 +188,52 @@ unsupported:
+   handshake(reply, 0x03);
+ }
+ 
++/* Bluetooth-only 03/04 is answered locally, never forwarded to USB. */
++static void auth_exchange(struct ds4_usb_auth *auth, const uint8_t *packet,
++                          size_t length, struct ds4_usb_reply *reply)
++{
++  if (!auth->auth2_enabled || length < 2 ||
++      !((packet[0] == 0x53 && packet[1] == 0x03) ||
++        ((packet[0] == 0x43 || packet[0] == 0x4b) && packet[1] == 0x04))) {
++    exchange(auth->hid, packet, length, reply);
++    return;
++  }
++  memset(reply, 0, sizeof(*reply));
++  reply->header = packet[0];
++  reply->report = packet[1];
++  handshake(reply, 0x04);
++  if (packet[0] == 0x53) {
++    auth->auth2_ready = 0; /* Never return a prior response after a rejected SET. */
++    if (length != 40 || !valid_crc(packet, length) || packet[3] >= 16) return;
++    uint8_t *out = auth->auth2_response;
++    MHASH hash = mhash_init(MHASH_SHA1);
++    if (hash == MHASH_FAILED) {
++      reply->error = ENOMEM;
++      handshake(reply, 0x0e);
++      return;
++    }
++    mhash(hash, auth->table[packet[3]], 32);
++    mhash(hash, packet + 4, 32);
++    mhash(hash, auth->salt, sizeof(auth->salt));
++    out[0] = 0xa3;
++    out[1] = 0x04;
++    out[2] = packet[2]; /* Echo the sequence and table slot. */
++    out[3] = packet[3];
++    mhash_deinit(hash, out + 4);
++    memcpy(out + 24, auth->salt, sizeof(auth->salt));
++    put_crc(out, sizeof(auth->auth2_response));
++    auth->auth2_ready = 1;
++    handshake(reply, 0x00);
++  } else {
++    if (length != (packet[0] == 0x4b ? 4U : 2U)) return;
++    if (packet[0] == 0x4b && ((unsigned)packet[2] | (unsigned)packet[3] << 8) < 47)
++      return;
++    if (!auth->auth2_ready) { handshake(reply, 0x01); return; } /* Not ready. */
++    reply->length = sizeof(auth->auth2_response);
++    memcpy(reply->data, auth->auth2_response, reply->length);
++  }
++}
++
+ static void *worker(void *arg)
+ {
+   struct ds4_usb_auth *auth = arg;
+@@ -133,7 +243,7 @@ static void *worker(void *arg)
+     if (length < 0 && errno == EINTR) continue;
+     if (length <= 0) break;
+     struct ds4_usb_reply reply;
+-    exchange(auth->hid, packet, length, &reply);
++    auth_exchange(auth, packet, length, &reply);
+     ssize_t sent;
+     do {
+       sent = send(auth->channel[1], &reply, sizeof(reply), MSG_NOSIGNAL);
+@@ -159,6 +269,16 @@ struct ds4_usb_auth *ds4_usb_open(const char *path)
+     goto fail;
+   }
+   if (flock(auth->hid, LOCK_EX | LOCK_NB) < 0) goto fail;
++  const char *table_path = getenv("GIMX_DS4_AUTH2_TABLE");
++  if (table_path) {
++    if (auth2_load(auth, table_path) < 0) {
++      int saved = errno;
++      fprintf(stderr, "AUTH2: cannot load table (requires 512 bytes and documented SHA-256): %s\n", strerror(saved));
++      errno = saved;
++      goto fail;
++    }
++    fprintf(stderr, "AUTH2: validated external table; local Bluetooth 03/04 enabled with a per-session salt\n");
++  }
+   if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, auth->channel) < 0) goto fail;
+   int error = pthread_create(&auth->worker, NULL, worker, auth);
+   if (error) { errno = error; goto fail; }
+@@ -168,6 +288,7 @@ fail:;
+   if (auth->channel[0] >= 0) close(auth->channel[0]);
+   if (auth->channel[1] >= 0) close(auth->channel[1]);
+   if (auth->hid >= 0) close(auth->hid);
++  explicit_bzero(auth, sizeof(*auth));
+   free(auth);
+   errno = saved;
+   return NULL;
+@@ -220,5 +341,6 @@ void ds4_usb_close(struct ds4_usb_auth *auth)
+   close(auth->channel[0]);
+   close(auth->channel[1]);
+   close(auth->hid);
++  explicit_bzero(auth, sizeof(*auth));
+   free(auth);
+ }

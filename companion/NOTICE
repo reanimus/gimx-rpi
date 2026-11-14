@@ -1,0 +1,9 @@
+The pairing implementation and extracted USB descriptor/report data are GPL-3.0-only.
+Protocol and byte arrays are derived from matlo/GIMX-firmwares, commit
+ab2215ebad5d50fd25b6b40ac74254f1f4c0bda5, EMUPS4PAIRING.
+Original sources and their full author/license notices are preserved under vendor/.
+Copyright 2013 Mathieu Laurendeau; based on work by Denver Gingerich and Dean Camera.
+https://github.com/matlo/GIMX-firmwares/tree/ab2215ebad5d50fd25b6b40ac74254f1f4c0bda5/EMUPS4PAIRING
+The optional test-only dummy_hcd.c is Linux v7.0 code under its own GPL-2.0-or-later
+license and retained notices. It is not included in the Pi runtime image.
+https://github.com/torvalds/linux/blob/v7.0/drivers/usb/gadget/udc/dummy_hcd.c

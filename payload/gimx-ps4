@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Store PS4 pairing keys or run the DS4 Bluetooth test (sudo required)."""
+import argparse
+import getpass
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+
+
+def addr(prompt):
+    value = input(prompt).strip().upper()
+    if not re.fullmatch(r'(?:[0-9A-F]{2}:){5}[0-9A-F]{2}', value):
+        raise ValueError('Invalid Bluetooth address')
+    return value
+
+
+def key(prompt):
+    value = getpass.getpass(prompt).strip().upper()
+    if not re.fullmatch(r'[0-9A-F]{32}', value) or value == '0' * 32:
+        raise ValueError('Expected a nonzero 16-byte link key (32 hex digits)')
+    return value
+
+
+def adapter_address(dev):
+    output = subprocess.check_output(['hciconfig', dev], text=True)
+    match = re.search(r'BD Address:\s*((?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2})\b', output)
+    if not match:
+        raise ValueError('Cannot read kernel Bluetooth address from hciconfig')
+    return match[1].upper()
+
+
+def usb_donor(device):
+    if device != 'auto':
+        if not re.fullmatch(r'/dev/hidraw[0-9]+', device):
+            raise ValueError('USB donor must be /dev/hidrawN')
+        return device
+    candidates = []
+    for path in sorted(Path('/sys/class/hidraw').glob('hidraw*/device/uevent')):
+        fields = dict(line.split('=', 1) for line in path.read_text().splitlines() if '=' in line)
+        parts = fields.get('HID_ID', '').split(':')
+        if len(parts) == 3 and tuple(int(p, 16) for p in parts) in ((3, 0x054c, 0x05c4), (3, 0x054c, 0x09cc)):
+            candidates.append('/dev/' + path.parent.parent.name)
+    if len(candidates) != 1:
+        raise ValueError(f'Expected one USB DS4, found {len(candidates)}; use --usb-auth /dev/hidrawN')
+    return candidates[0]
+
+
+def validate_table(filename):
+    table = Path(filename).resolve()
+    if not table.is_file() or table.stat().st_size != 512:
+        raise ValueError('AUTH2 table must be a regular 512-byte file')
+    with table.open('rb') as f:
+        data = f.read(513)
+    if len(data) != 512 or hashlib.sha256(data).hexdigest() != '98b700c568bd40d1a3a280a63918c357b1713666d7fb992ab08e19f96ba31b7d':
+        raise ValueError('AUTH2 table SHA-256 does not match the documented controller extraction')
+    return str(table)
+
+
+def validate_keys(directory):
+    directory = Path(directory).resolve()
+    for name, minimum, maximum in (('key.pem', 1, 16384), ('serial.txt', 16, 128), ('sig.bin', 256, 256)):
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or not minimum <= path.stat().st_size <= maximum:
+            raise ValueError(f'Software auth requires a regular {name} file of the documented size')
+    with (directory / 'serial.txt').open('rb') as f:
+        serial = f.read(129).strip()
+    if not re.fullmatch(rb'(?:[0-9a-fA-F]{16}|[0-9a-fA-F]{32})', serial):
+        raise ValueError('serial.txt must contain 16 or 32 hexadecimal characters')
+    # The C backend checks the PEM and RSA key before connecting to the PS4.
+    return str(directory)
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('action', choices=['configure', 'run'])
+    p.add_argument('--hci', default='hci0')
+    p.add_argument('--config', default='ps4-smoke.xml')
+    p.add_argument('--udp-port', type=int, default=51914)
+    p.add_argument('--network-only', action='store_true', help='Use UDP input without a keyboard mapping')
+    p.add_argument('--auth-mode', choices=['bluetooth', 'usb', 'software'],
+                   help='Authentication mode (default: bluetooth; --usb-auth implies usb)')
+    p.add_argument('--usb-auth', nargs='?', const='auto', metavar='/dev/hidrawN',
+                   help='Compatibility alias for --auth-mode usb with an optional donor path')
+    p.add_argument('--usb-device', metavar='/dev/hidrawN', help='USB donor path; otherwise auto-discovered')
+    p.add_argument('--auth-trace', '--usb-auth-trace', dest='auth_trace', action='store_true',
+                   help='Log local authentication metadata, never keys or payloads')
+    p.add_argument('--auth2-table', metavar='PATH', help='Controller-extracted table, required for USB/software modes')
+    p.add_argument('--auth-keys', metavar='DIRECTORY', help='Software mode: directory containing key.pem, serial.txt and sig.bin')
+    a = p.parse_args()
+    mode = a.auth_mode or ('usb' if a.usb_auth is not None else 'bluetooth')
+    if any((a.auth_mode, a.usb_auth, a.usb_device, a.auth_trace, a.auth2_table, a.auth_keys)) and a.action != 'run':
+        p.error('Authentication options apply to run only; keep the existing pairing configuration')
+    if (a.usb_auth is not None or a.usb_device) and mode != 'usb':
+        p.error('USB donor options require --auth-mode usb')
+    if a.usb_auth is not None and a.usb_device:
+        p.error('Use either --usb-auth or --usb-device')
+    if mode == 'bluetooth' and (a.auth2_table or a.auth_keys or a.auth_trace):
+        p.error('Bluetooth donor mode does not use local authentication files or tracing')
+    if mode in ('usb', 'software') and not a.auth2_table:
+        p.error('USB/software mode requires --auth2-table')
+    if mode == 'software' and not a.auth_keys:
+        p.error('Software mode requires --auth-keys DIRECTORY')
+    if mode != 'software' and a.auth_keys:
+        p.error('--auth-keys requires --auth-mode software')
+    if not 1 <= a.udp_port <= 65535:
+        p.error('UDP port must be in 1..65535')
+    if os.getuid() != 0:
+        p.error('Run with sudo; pairing files and config live under /root/.gimx')
+    if not re.fullmatch(r'hci[0-9]+', a.hci):
+        p.error('Invalid HCI index')
+    os.umask(0o077)
+    settings = Path('/var/lib/gimx/ps4.json')
+    if a.action == 'configure':
+        adapter = addr('Pi adapter address used during pairing: ')
+        ds4 = addr('Real DS4 Bluetooth address: ')
+        ds4key = key('DS4-to-Pi link key: ')
+        ps4 = addr('PS4 Bluetooth address: ')
+        ps4key = key('PS4-to-Pi link key from pairing device: ')
+        if len({adapter, ds4, ps4}) != 3:
+            raise ValueError('Pi, real DS4, and PS4 must have distinct addresses')
+        dest = Path('/root/.gimx/bluetooth') / adapter
+        dest.mkdir(parents=True, exist_ok=True)
+        f = dest / 'linkkeys'
+        if f.exists() or settings.exists():
+            raise ValueError('Pairing already exists; back up/remove it explicitly before replacing')
+        f.write_text(f'{ds4} {ds4key} 4 0\n{ps4} {ps4key} 4 0\n')
+        settings.parent.mkdir(parents=True, exist_ok=True)
+        settings.write_text(json.dumps({'adapter': adapter, 'ps4': ps4}) + '\n')
+        print('Stored pairing. Run: sudo gimx-ps4 run')
+        return
+    cfg = json.loads(settings.read_text())
+    actual = adapter_address(a.hci)
+    if actual != cfg['adapter']:
+        raise ValueError(f"Adapter address differs from pairing. Run sudo gimx-bt set {cfg['adapter']} first")
+    if not a.network_only and (Path(a.config).name != a.config or not (Path('/root/.gimx/config') / a.config).is_file()):
+        raise ValueError('Config must be a filename under /root/.gimx/config')
+    if not Path('/var/lib/gimx/install.ready').exists():
+        raise ValueError('GIMX build is not ready; inspect /var/log/gimx/install.log')
+    # An old GIMX binary silently ignores environment variables: require the
+    # installer marker as well as install.ready before using this extension.
+    for name in ('GIMX_DS4_USB', 'GIMX_DS4_USB_TRACE', 'GIMX_DS4_AUTH2_TABLE', 'GIMX_DS4_KEYS'):
+        os.environ.pop(name, None)
+    if mode != 'bluetooth':
+        if not Path('/var/lib/gimx/auth-modes.ready').exists():
+            raise ValueError('Authentication modes extension is not installed; run the authentication update installer')
+        os.environ['GIMX_DS4_AUTH2_TABLE'] = validate_table(a.auth2_table)
+        if mode == 'usb':
+            os.environ['GIMX_DS4_USB'] = usb_donor(a.usb_device or a.usb_auth or 'auto')
+        else:
+            os.environ['GIMX_DS4_KEYS'] = validate_keys(a.auth_keys)
+        if a.auth_trace:
+            os.environ['GIMX_DS4_USB_TRACE'] = '1'
+    subprocess.run(['systemctl', 'mask', '--runtime', '--now', 'bluetooth.service'], check=True)
+    Path('/root/.gimx/log').mkdir(parents=True, exist_ok=True)
+    if mode == 'usb':
+        print('USB authentication: keep the real DS4 connected by USB; no physical PS press needed. '
+              'Turn on the PS4. Local Bluetooth AUTH2 enabled. Ctrl-C stops GIMX.', flush=True)
+    elif mode == 'software':
+        print('Software authentication: no DS4 controller needed. Turn on the PS4. '
+              'Local Bluetooth AUTH2 and RSA signing enabled. Ctrl-C stops GIMX.', flush=True)
+    else:
+        print('Unplug the real DS4 from USB and press its PS button. Ctrl-C stops GIMX.', flush=True)
+    args = ['gimx', '--type', 'DS4', '--src', f'127.0.0.1:{a.udp_port}']
+    if not a.network_only:
+        args += ['--config', a.config]
+    args += ['--hci', a.hci[3:], '--status', '--bdaddr', cfg['ps4']]
+    os.execvp('gimx', args)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError, subprocess.CalledProcessError) as e:
+        raise SystemExit(str(e))

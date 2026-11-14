@@ -1,0 +1,540 @@
+diff --git a/core/Makefile b/core/Makefile
+index 74a2eb3..333a1d5 100644
+--- a/core/Makefile
++++ b/core/Makefile
+@@ -55,7 +55,7 @@ LDLIBS += -lpdcursesw
+ endif
+ 
+ ifneq ($(OS),Windows_NT)
+-LDLIBS += -lm -lbluetooth -lmhash -pthread
++LDLIBS += -lm -lbluetooth -lmhash -lcrypto -pthread
+ CFLAGS += -pthread
+ else
+ LDLIBS += $(shell sdl2-config --libs) -lws2_32 -lintl
+diff --git a/core/connectors/btds4.c b/core/connectors/btds4.c
+index e2a05d6..db12a41 100644
+--- a/core/connectors/btds4.c
++++ b/core/connectors/btds4.c
+@@ -144,7 +144,7 @@ typedef struct
+ 
+ struct btds4_state {
+     struct ds4_usb_auth *usb_auth;
+-    int usb_mode, usb_trace, usb_unsupported;
++    int auth_mode, usb_trace, usb_unsupported;
+     int status_initialized;
+     gtime last_report_time;
+     struct {
+@@ -194,13 +194,15 @@ void btds4_get_status(int number, uint32_t *flags, uint32_t *report_age_ms)
+     return;
+   const struct btds4_state *s = states + number;
+   *flags = BTDS4_STATUS_INITIALIZED;
+-  if (s->usb_mode) *flags |= BTDS4_STATUS_USB_AUTH;
++  if (s->auth_mode == 1) *flags |= BTDS4_STATUS_USB_AUTH;
++  if (s->auth_mode == 2) *flags |= BTDS4_STATUS_SOFTWARE_AUTH;
+   if (s->usb_unsupported) *flags |= BTDS4_STATUS_USB_UNSUPPORTED;
+   if (s->sys.shutdown)
+     *flags |= BTDS4_STATUS_SHUTDOWN;
+   else
+   {
+-    if (s->usb_auth && ds4_usb_alive(s->usb_auth)) *flags |= BTDS4_STATUS_USB_CONNECTED;
++    if (s->usb_auth && ds4_usb_alive(s->usb_auth))
++      *flags |= s->auth_mode == 2 ? BTDS4_STATUS_SOFTWARE_READY : BTDS4_STATUS_USB_CONNECTED;
+     if (s->ps4_channels.control.id >= 0)
+       *flags |= s->ps4_channels.control.pending ? BTDS4_STATUS_PS4_CONTROL_PENDING : BTDS4_STATUS_PS4_CONTROL;
+     if (s->ps4_channels.interrupt.id >= 0)
+@@ -308,7 +310,7 @@ static int close_ps4_sdp(void * user)
+   }
+ 
+   /* USB mode does not use the donor-side Bluetooth SDP/ACL workaround. */
+-  if (state->usb_mode) return 0;
++  if (state->auth_mode) return 0;
+ 
+   /*
+    * Warning: this is really hackish...
+@@ -466,7 +468,7 @@ static int close_ds4_interrupt(void * user)
+ static int usb_auth_failed(void *user)
+ {
+   struct btds4_state *state = states + (intptr_t)user;
+-  fprintf(stderr, "USB auth transport failed; stopping this PS4 session\n");
++  fprintf(stderr, "Local auth backend failed; stopping this PS4 session\n");
+   state->sys.shutdown = 1;
+   return 1;
+ }
+@@ -481,11 +483,11 @@ static int read_usb_auth(void *user)
+   }
+   if (reply.unsupported) {
+     state->usb_unsupported = 1;
+-    fprintf(stderr, "USB auth: unsupported Bluetooth request header=0x%02x report=0x%02x; no USB equivalent implemented\n",
++    fprintf(stderr, "Local auth: unsupported Bluetooth request header=0x%02x report=0x%02x; no handler implemented\n",
+             reply.header, reply.report);
+   }
+   if (state->usb_trace || reply.error) {
+-    fprintf(stderr, "USB auth: header=0x%02x report=0x%02x response_bytes=%zu handshake=%s errno=%d\n",
++    fprintf(stderr, "Local auth: header=0x%02x report=0x%02x response_bytes=%zu handshake=%s errno=%d\n",
+             reply.header, reply.report, reply.length,
+             reply.length == 1 ? (reply.data[0] == 0 ? "success" : "error") : "data", reply.error);
+   }
+@@ -585,7 +587,7 @@ static int read_ps4_interrupt(void * user)
+   {
+     fprintf(stderr, "error reading ps4 interrupt\n");
+   }
+-  else if (len >= 9 && !states[btds4_number].usb_mode)
++  else if (len >= 9 && !states[btds4_number].auth_mode)
+   {
+     switch(buf[1])
+     {
+@@ -757,7 +759,7 @@ static int listen_accept_sdp(int channel, bdaddr_t * src)
+       /*
+        * Look for a controller that has no ds4 bdaddr.
+        */
+-      if(!states[i].usb_mode && strchr(states[i].ps4_bdaddr, ':') && !strchr(states[i].ds4_bdaddr, ':'))
++      if(!states[i].auth_mode && strchr(states[i].ps4_bdaddr, ':') && !strchr(states[i].ds4_bdaddr, ':'))
+       {
+         ba2str(src, states[i].ds4_bdaddr);
+         states[i].ds4_channels.sdp.id = channel;
+@@ -929,16 +931,21 @@ int btds4_init(int btds4_number, int dongle_index, const char * bdaddr_dst)
+ 
+   memcpy(&state->bt_report, &init_report_btds4, sizeof(s_btds4_report));
+   const char *usb_path = getenv("GIMX_DS4_USB");
+-  if (usb_path && *usb_path) {
++  const char *keys = getenv("GIMX_DS4_KEYS");
++  if (usb_path || keys) {
++    if ((usb_path && keys) || !getenv("GIMX_DS4_AUTH2_TABLE")) {
++      fprintf(stderr, "Select either USB or software auth and supply the AUTH2 table\n");
++      return -1;
++    }
+     if (gimx_params.btstack || btds4_number) {
+-      fprintf(stderr, "USB auth requires BlueZ and a single controller\n");
++      fprintf(stderr, "Local auth requires BlueZ and a single controller\n");
+       return -1;
+     }
+-    state->usb_mode = 1;
++    state->auth_mode = keys ? 2 : 1;
+     state->usb_trace = getenv("GIMX_DS4_USB_TRACE") != NULL;
+     state->joystick_id = -1;
+     state->usb_auth = ds4_usb_open(usb_path);
+-    if (!state->usb_auth) { perror("open USB DS4 authentication donor"); return -1; }
++    if (!state->usb_auth) { perror("open local DS4 authentication backend"); return -1; }
+     static const GPOLL_CALLBACKS callbacks = {
+       .fp_read = read_usb_auth, .fp_close = usb_auth_failed
+     };
+@@ -947,7 +954,8 @@ int btds4_init(int btds4_number, int dongle_index, const char * bdaddr_dst)
+       state->usb_auth = NULL;
+       return -1;
+     }
+-    fprintf(stderr, "Experimental USB auth donor: %s; Bluetooth 03/04 are unsupported\n", usb_path);
++    fprintf(stderr, "DS4 authentication: %s; local Bluetooth AUTH2 enabled\n",
++            keys ? "software (no controller)" : "USB donor");
+     return 0;
+   }
+   state->joystick_id = ginput_register_joystick(DS4_DEVICE_NAME, GE_HAPTIC_RUMBLE, ds4_interrupt_rumble);
+@@ -992,7 +1000,8 @@ int btds4_listen(int btds4_number)
+ 
+   if (state->usb_auth) {
+     void *user = (void *)(intptr_t)btds4_number;
+-    ginfo("connecting to PS4 %s with USB authentication donor\n", state->ps4_bdaddr);
++    ginfo("connecting to PS4 %s with %s authentication\n", state->ps4_bdaddr,
++          state->auth_mode == 2 ? "software" : "USB donor");
+     state->ps4_channels.control.id = l2cap_abs_get()->connect(state->dongle_bdaddr.str, state->ps4_bdaddr,
+         PSM_HID_CONTROL, L2CAP_ABS_LM_MASTER | L2CAP_ABS_LM_AUTH | L2CAP_ABS_LM_ENCRYPT,
+         user, connect_ps4_control, close_ps4_control);
+@@ -1036,12 +1045,12 @@ int btds4_send_interrupt(int btds4_number, s_report_ds4* report, int active)
+     return -1;
+   }
+ 
+-  if (state->usb_mode && (!state->usb_auth || !ds4_usb_alive(state->usb_auth))) {
++  if (state->auth_mode && (!state->usb_auth || !ds4_usb_alive(state->usb_auth))) {
+     usb_auth_failed((void *)(intptr_t)btds4_number);
+     return -1;
+   }
+   if(state->ps4_channels.interrupt.id < 0 || state->ps4_channels.interrupt.pending ||
+-      (!state->usb_mode && state->ds4_channels.interrupt.id < 0))
++      (!state->auth_mode && state->ds4_channels.interrupt.id < 0))
+   {
+     return 0;
+   }
+diff --git a/core/connectors/btds4.h b/core/connectors/btds4.h
+index fe74086..2fc9cdb 100644
+--- a/core/connectors/btds4.h
++++ b/core/connectors/btds4.h
+@@ -23,6 +23,8 @@
+ #define BTDS4_STATUS_USB_AUTH            (1U << 9)
+ #define BTDS4_STATUS_USB_CONNECTED       (1U << 10)
+ #define BTDS4_STATUS_USB_UNSUPPORTED     (1U << 11)
++#define BTDS4_STATUS_SOFTWARE_AUTH       (1U << 12)
++#define BTDS4_STATUS_SOFTWARE_READY      (1U << 13)
+ void btds4_get_status(int number, uint32_t *flags, uint32_t *report_age_ms);
+ 
+ int btds4_init(int btds4_number, int dongle_index, const char * bdaddr_dst);
+diff --git a/core/connectors/linux/usb_auth/ds4_software_auth.c b/core/connectors/linux/usb_auth/ds4_software_auth.c
+new file mode 100644
+index 0000000..4d969fb
+--- /dev/null
++++ b/core/connectors/linux/usb_auth/ds4_software_auth.c
+@@ -0,0 +1,221 @@
++/* DS4 RSA authentication with separately supplied, non-redistributable files.
++ * GPL-3.0-or-later. No controller keys or certificates are included.
++ * Wire layout/serial padding reference: GP2040-CE PS4Auth.cpp, PS4Driver.cpp
++ * and SettingsPage.jsx at dd80f3f325d3f5de4875e94e493c3fbd51ef6ee6.
++ */
++#include "ds4_software_auth.h"
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <openssl/bn.h>
++#include <openssl/core_names.h>
++#include <openssl/evp.h>
++#include <openssl/pem.h>
++#include <openssl/rsa.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++struct ds4_software_auth {
++  EVP_PKEY *key;
++  uint8_t serial[16], modulus[256], exponent[256], certificate[256];
++  uint8_t nonce[256], response[1064], last_page[64], sequence;
++  unsigned received, cursor;
++  int ready;
++};
++
++static int read_material(int directory, const char *name, uint8_t *out,
++                         size_t capacity, size_t *length)
++{
++  int fd = openat(directory, name, O_RDONLY | O_CLOEXEC | O_NONBLOCK | O_NOFOLLOW);
++  if (fd < 0) return -1;
++  struct stat st;
++  if (fstat(fd, &st) < 0) goto fail;
++  if (!S_ISREG(st.st_mode) || st.st_size <= 0 || (uint64_t)st.st_size > capacity) {
++    errno = EINVAL; goto fail;
++  }
++  *length = 0;
++  while (*length < (size_t)st.st_size) {
++    ssize_t n = read(fd, out + *length, st.st_size - *length);
++    if (n < 0 && errno == EINTR) continue;
++    if (n <= 0) { if (n == 0) errno = EINVAL; goto fail; }
++    *length += n;
++  }
++  uint8_t extra;
++  ssize_t n;
++  do { n = read(fd, &extra, 1); } while (n < 0 && errno == EINTR);
++  if (n != 0) { if (n > 0) errno = EINVAL; goto fail; }
++  close(fd);
++  return 0;
++fail:;
++  int saved = errno;
++  close(fd);
++  errno = saved;
++  return -1;
++}
++
++static int no_password(char *buf, int size, int writing, void *user)
++{
++  (void)buf; (void)size; (void)writing; (void)user;
++  return 0; /* Never prompt from a service or worker. */
++}
++
++static int hex_digit(uint8_t c)
++{
++  if (c >= '0' && c <= '9') return c - '0';
++  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
++  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
++  return -1;
++}
++
++struct ds4_software_auth *ds4_software_open(const char *directory)
++{
++  struct ds4_software_auth *auth = calloc(1, sizeof(*auth));
++  if (!auth) return NULL;
++  int fd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
++  uint8_t pem[16384], serial[128];
++  size_t length;
++  BIO *bio = NULL;
++  EVP_PKEY_CTX *ctx = NULL;
++  BIGNUM *n = NULL, *e = NULL;
++  if (fd < 0 || read_material(fd, "key.pem", pem, sizeof(pem), &length) < 0) goto fail;
++  errno = EINVAL;
++  bio = BIO_new_mem_buf(pem, length);
++  if (!bio) goto fail;
++  auth->key = PEM_read_bio_PrivateKey(bio, NULL, no_password, NULL);
++  if (!auth->key || !EVP_PKEY_is_a(auth->key, "RSA") || EVP_PKEY_get_bits(auth->key) != 2048)
++    goto fail;
++  ctx = EVP_PKEY_CTX_new_from_pkey(NULL, auth->key, NULL);
++  if (!ctx || EVP_PKEY_private_check(ctx) != 1 || EVP_PKEY_pairwise_check(ctx) != 1 ||
++      EVP_PKEY_get_bn_param(auth->key, OSSL_PKEY_PARAM_RSA_N, &n) != 1 ||
++      EVP_PKEY_get_bn_param(auth->key, OSSL_PKEY_PARAM_RSA_E, &e) != 1 ||
++      !BN_is_odd(e) || BN_cmp(e, BN_value_one()) <= 0 || BN_num_bits(e) > 32 ||
++      BN_bn2binpad(n, auth->modulus, 256) != 256 ||
++      BN_bn2binpad(e, auth->exponent, 256) != 256) goto fail;
++  if (read_material(fd, "serial.txt", serial, sizeof(serial), &length) < 0) goto fail;
++  size_t first = 0;
++  while (first < length && isspace(serial[first])) ++first;
++  while (length > first && isspace(serial[length - 1])) --length;
++  size_t digits = length - first;
++  errno = EINVAL;
++  if (digits != 16 && digits != 32) goto fail;
++  for (size_t i = 0; i < digits / 2; ++i) {
++    int high = hex_digit(serial[first + i * 2]), low = hex_digit(serial[first + i * 2 + 1]);
++    if (high < 0 || low < 0) goto fail;
++    auth->serial[16 - digits / 2 + i] = (high << 4) | low;
++  }
++  if (read_material(fd, "sig.bin", auth->certificate, sizeof(auth->certificate), &length) < 0)
++    goto fail;
++  if (length != sizeof(auth->certificate)) { errno = EINVAL; goto fail; }
++  BIO_free(bio);
++  EVP_PKEY_CTX_free(ctx);
++  BN_free(n); BN_free(e);
++  explicit_bzero(pem, sizeof(pem));
++  explicit_bzero(serial, sizeof(serial));
++  close(fd);
++  return auth;
++fail:;
++  int saved = errno ? errno : EINVAL;
++  BIO_free(bio);
++  EVP_PKEY_CTX_free(ctx);
++  BN_free(n); BN_free(e);
++  explicit_bzero(pem, sizeof(pem));
++  explicit_bzero(serial, sizeof(serial));
++  if (fd >= 0) close(fd);
++  ds4_software_close(auth);
++  errno = saved;
++  return NULL;
++}
++
++void ds4_software_reset(struct ds4_software_auth *auth)
++{
++  auth->received = auth->cursor = auth->ready = 0;
++  explicit_bzero(auth->nonce, sizeof(auth->nonce));
++  explicit_bzero(auth->response, sizeof(auth->response));
++  explicit_bzero(auth->last_page, sizeof(auth->last_page));
++}
++
++static int sign_nonce(struct ds4_software_auth *auth)
++{
++  EVP_MD_CTX *md = EVP_MD_CTX_new();
++  EVP_PKEY_CTX *ctx = NULL;
++  size_t size = 256;
++  int ok = md && EVP_DigestSignInit(md, &ctx, EVP_sha256(), NULL, auth->key) == 1 &&
++      EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_PSS_PADDING) > 0 &&
++      EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) > 0 &&
++      EVP_PKEY_CTX_set_rsa_pss_saltlen(ctx, 32) > 0 &&
++      EVP_DigestSign(md, auth->response, &size, auth->nonce, 256) == 1 && size == 256;
++  EVP_MD_CTX_free(md);
++  if (!ok) { ds4_software_reset(auth); errno = EIO; return -1; }
++  memcpy(auth->response + 256, auth->serial, 16);
++  memcpy(auth->response + 272, auth->modulus, 256);
++  memcpy(auth->response + 528, auth->exponent, 256);
++  memcpy(auth->response + 784, auth->certificate, 256);
++  memset(auth->response + 1040, 0, 24);
++  auth->ready = 1;
++  auth->cursor = 0;
++  return 0;
++}
++
++int ds4_software_set(struct ds4_software_auth *auth, const uint8_t *data, size_t length)
++{
++  if (length != 64 || data[0] != 0xf0 || data[2] > 4 || data[3]) goto invalid;
++  unsigned page = data[2];
++  if (auth->received && page + 1 == auth->received && data[1] == auth->sequence &&
++      !memcmp(auth->last_page, data, 64)) return 64; /* Retry the most recent SET. */
++  if (page == 0) { ds4_software_reset(auth); auth->sequence = data[1]; }
++  if (page != auth->received || data[1] != auth->sequence) goto invalid;
++  memcpy(auth->nonce + page * 56, data + 4, page == 4 ? 32 : 56);
++  memcpy(auth->last_page, data, 64);
++  ++auth->received;
++  if (page == 4 && sign_nonce(auth) < 0) return -1;
++  return 64;
++invalid:
++  ds4_software_reset(auth);
++  errno = EPROTO;
++  return -1;
++}
++
++/* Public, non-identity feature bytes from GP2040-CE PS4Driver.cpp. These do not
++ * include private keys, serials, certificates or the controller AUTH2 table.
++ */
++static const uint8_t calibration[36] = {
++  0xfe,0xff,0x0e,0x00,0x04,0x00,0xd4,0x22,0x2a,0xdd,0xbb,0x22,
++  0x5e,0xdd,0x81,0x22,0x84,0xdd,0x1c,0x02,0x1c,0x02,0x85,0x1f,
++  0xb0,0xe0,0xc6,0x20,0xb5,0xe0,0xb1,0x20,0x83,0xdf,0x0c,0x00
++};
++static const uint8_t firmware[48] = {
++  0x4a,0x75,0x6e,0x20,0x20,0x39,0x20,0x32,0x30,0x31,0x37,0,0,0,0,0,
++  0x31,0x32,0x3a,0x33,0x36,0x3a,0x34,0x31,0,0,0,0,0,0,0,0,
++  0,0x01,0x08,0xb4,0x01,0,0,0,0x07,0xa0,0x10,0x20,0,0xa0,0x02,0
++};
++
++int ds4_software_get(struct ds4_software_auth *auth, uint8_t *data, size_t length)
++{
++  if (!length) { errno = EINVAL; return -1; }
++  uint8_t id = data[0];
++  memset(data, 0, length);
++  data[0] = id;
++  if (id == 0x02 && length == 37) memcpy(data + 1, calibration, sizeof(calibration));
++  else if (id == 0xa3 && length == 49) memcpy(data + 1, firmware, sizeof(firmware));
++  else if (id == 0xf2 && length == 16) {
++    data[1] = auth->sequence;
++    data[2] = auth->ready ? 0 : 0x10;
++  } else if (id == 0xf1 && length == 64) {
++    if (!auth->ready || auth->cursor >= 19) { errno = EAGAIN; return -1; }
++    data[1] = auth->sequence;
++    data[2] = auth->cursor;
++    memcpy(data + 4, auth->response + auth->cursor * 56, 56);
++    if (++auth->cursor == 19) auth->ready = 0;
++  } else { errno = EINVAL; return -1; }
++  return length; /* Common transport adds report CRCs. */
++}
++
++void ds4_software_close(struct ds4_software_auth *auth)
++{
++  if (!auth) return;
++  EVP_PKEY_free(auth->key);
++  explicit_bzero(auth, sizeof(*auth));
++  free(auth);
++}
+diff --git a/core/connectors/linux/usb_auth/ds4_software_auth.h b/core/connectors/linux/usb_auth/ds4_software_auth.h
+new file mode 100644
+index 0000000..7665fad
+--- /dev/null
++++ b/core/connectors/linux/usb_auth/ds4_software_auth.h
+@@ -0,0 +1,13 @@
++/* User-supplied DS4 software authentication. GPL-3.0-or-later. */
++#ifndef DS4_SOFTWARE_AUTH_H
++#define DS4_SOFTWARE_AUTH_H
++#include <stddef.h>
++#include <stdint.h>
++struct ds4_software_auth;
++struct ds4_software_auth *ds4_software_open(const char *directory);
++void ds4_software_close(struct ds4_software_auth *auth);
++void ds4_software_reset(struct ds4_software_auth *auth);
++/* HID-style buffers include the report ID; the transport validates/rebuilds CRCs. */
++int ds4_software_set(struct ds4_software_auth *auth, const uint8_t *data, size_t length);
++int ds4_software_get(struct ds4_software_auth *auth, uint8_t *data, size_t length);
++#endif
+diff --git a/core/connectors/linux/usb_auth/ds4_usb_auth.c b/core/connectors/linux/usb_auth/ds4_usb_auth.c
+index a0998a3..f8bff76 100644
+--- a/core/connectors/linux/usb_auth/ds4_usb_auth.c
++++ b/core/connectors/linux/usb_auth/ds4_usb_auth.c
+@@ -3,6 +3,7 @@
+  * Bluetooth 03/04 MUST NOT be passed to the unrelated USB report 04.
+  */
+ #include "ds4_usb_auth.h"
++#include "ds4_software_auth.h"
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <linux/hidraw.h>
+@@ -22,6 +23,7 @@
+ 
+ struct ds4_usb_auth {
+   int hid, channel[2], busy;
++  struct ds4_software_auth *software;
+   pthread_t worker;
+   int auth2_enabled, auth2_ready;
+   uint8_t table[16][32], salt[20], auth2_response[48];
+@@ -127,7 +129,7 @@ static void calibration_to_bt(uint8_t *data)
+   }
+ }
+ 
+-static void exchange(int hid, const uint8_t *packet, size_t length,
++static void exchange(struct ds4_usb_auth *auth, const uint8_t *packet, size_t length,
+                      struct ds4_usb_reply *reply)
+ {
+   uint8_t usb[64] = {0};
+@@ -140,10 +142,15 @@ static void exchange(int hid, const uint8_t *packet, size_t length,
+   if (length < 2) return;
+   if (packet[0] == 0x53) {
+     if (packet[1] != 0xf0) goto unsupported;
+-    if (length != 65 || !valid_crc(packet, length)) return;
++    if (length != 65 || !valid_crc(packet, length)) {
++      if (auth->software) ds4_software_reset(auth->software);
++      return;
++    }
+     memcpy(usb, packet + 1, sizeof(usb));
+     put_crc(usb, sizeof(usb)); /* USB excludes the HID transaction header. */
+-    int ret = ioctl(hid, HIDIOCSFEATURE(sizeof(usb)), usb);
++    int ret = auth->software ? ds4_software_set(auth->software, usb, sizeof(usb)) :
++        ioctl(auth->hid, HIDIOCSFEATURE(sizeof(usb)), usb);
++    if (auth->software && ret < 0 && (errno == EPROTO || errno == EINVAL)) return;
+     if (ret != (int)sizeof(usb)) {
+       reply->error = ret < 0 ? errno : EPROTO;
+       handshake(reply, 0x0e);
+@@ -165,7 +172,11 @@ static void exchange(int hid, const uint8_t *packet, size_t length,
+   if (packet[0] == 0x4b && ((unsigned)packet[2] | (unsigned)packet[3] << 8) < bt_length)
+     return;
+   uint8_t id = usb[0];
+-  int ret = ioctl(hid, HIDIOCGFEATURE(usb_length), usb);
++  int ret = auth->software ? ds4_software_get(auth->software, usb, usb_length) :
++      ioctl(auth->hid, HIDIOCGFEATURE(usb_length), usb);
++  if (auth->software && ret < 0 && errno == EAGAIN) { handshake(reply, 0x01); return; }
++  if (auth->software && ret == (int)usb_length && (id == 0xf1 || id == 0xf2))
++    put_crc(usb, usb_length);
+   if (ret != (int)usb_length || usb[0] != id) {
+     reply->error = ret < 0 ? errno : EPROTO;
+     handshake(reply, 0x0e);
+@@ -195,7 +206,7 @@ static void auth_exchange(struct ds4_usb_auth *auth, const uint8_t *packet,
+   if (!auth->auth2_enabled || length < 2 ||
+       !((packet[0] == 0x53 && packet[1] == 0x03) ||
+         ((packet[0] == 0x43 || packet[0] == 0x4b) && packet[1] == 0x04))) {
+-    exchange(auth->hid, packet, length, reply);
++    exchange(auth, packet, length, reply);
+     return;
+   }
+   memset(reply, 0, sizeof(*reply));
+@@ -258,17 +269,28 @@ struct ds4_usb_auth *ds4_usb_open(const char *path)
+ {
+   struct ds4_usb_auth *auth = calloc(1, sizeof(*auth));
+   if (!auth) return NULL;
+-  auth->hid = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
+-  auth->channel[0] = auth->channel[1] = -1;
+-  if (auth->hid < 0) goto fail;
+-  struct hidraw_devinfo info;
+-  if (ioctl(auth->hid, HIDIOCGRAWINFO, &info) < 0) goto fail;
+-  if (info.bustype != BUS_USB || (uint16_t)info.vendor != 0x054c ||
+-      ((uint16_t)info.product != 0x09cc && (uint16_t)info.product != 0x05c4)) {
+-    errno = ENODEV;
+-    goto fail;
++  auth->hid = auth->channel[0] = auth->channel[1] = -1;
++  const char *keys = getenv("GIMX_DS4_KEYS");
++  if (path) {
++    if (keys) { errno = EINVAL; goto fail; }
++    auth->hid = open(path, O_RDWR | O_CLOEXEC | O_NONBLOCK);
++    if (auth->hid < 0) goto fail;
++    struct hidraw_devinfo info;
++    if (ioctl(auth->hid, HIDIOCGRAWINFO, &info) < 0) goto fail;
++    if (info.bustype != BUS_USB || (uint16_t)info.vendor != 0x054c ||
++        ((uint16_t)info.product != 0x09cc && (uint16_t)info.product != 0x05c4)) {
++      errno = ENODEV;
++      goto fail;
++    }
++    if (flock(auth->hid, LOCK_EX | LOCK_NB) < 0) goto fail;
++  } else {
++    if (!keys || !*keys || !getenv("GIMX_DS4_AUTH2_TABLE")) { errno = EINVAL; goto fail; }
++    auth->software = ds4_software_open(keys);
++    if (!auth->software) {
++      fprintf(stderr, "Software auth: cannot load RSA-2048 key.pem, hex serial.txt and 256-byte sig.bin\n");
++      goto fail;
++    }
+   }
+-  if (flock(auth->hid, LOCK_EX | LOCK_NB) < 0) goto fail;
+   const char *table_path = getenv("GIMX_DS4_AUTH2_TABLE");
+   if (table_path) {
+     if (auth2_load(auth, table_path) < 0) {
+@@ -288,6 +310,7 @@ fail:;
+   if (auth->channel[0] >= 0) close(auth->channel[0]);
+   if (auth->channel[1] >= 0) close(auth->channel[1]);
+   if (auth->hid >= 0) close(auth->hid);
++  ds4_software_close(auth->software);
+   explicit_bzero(auth, sizeof(*auth));
+   free(auth);
+   errno = saved;
+@@ -340,7 +363,8 @@ void ds4_usb_close(struct ds4_usb_auth *auth)
+   pthread_join(auth->worker, NULL);
+   close(auth->channel[0]);
+   close(auth->channel[1]);
+-  close(auth->hid);
++  if (auth->hid >= 0) close(auth->hid);
++  ds4_software_close(auth->software);
+   explicit_bzero(auth, sizeof(*auth));
+   free(auth);
+ }

@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<root>
+  <controller id="1" dpi="800" type="DS4">
+    <configuration id="1">
+      <trigger type="keyboard" id="0" name="" button_id="F12" switch_back="no" delay="0"/>
+      <mouse_options_list/>
+      <intensity_list/>
+      <button_map>
+        <button id="abs_axis_2" label="PS"><device type="keyboard" id="0" name=""/><event type="button" id="HOME"/></button>
+        <button id="abs_axis_9" label="Cross"><device type="keyboard" id="0" name=""/><event type="button" id="SPACE"/></button>
+        <button id="abs_axis_8" label="Circle"><device type="keyboard" id="0" name=""/><event type="button" id="BACKSPACE"/></button>
+        <button id="abs_axis_1" label="Options"><device type="keyboard" id="0" name=""/><event type="button" id="RETURN"/></button>
+        <button id="abs_axis_3" label="Up"><device type="keyboard" id="0" name=""/><event type="button" id="UP"/></button>
+        <button id="abs_axis_4" label="Right"><device type="keyboard" id="0" name=""/><event type="button" id="RIGHT"/></button>
+        <button id="abs_axis_5" label="Down"><device type="keyboard" id="0" name=""/><event type="button" id="DOWN"/></button>
+        <button id="abs_axis_6" label="Left"><device type="keyboard" id="0" name=""/><event type="button" id="LEFT"/></button>
+      </button_map>
+      <axis_map/>
+    </configuration>
+  </controller>
+</root>

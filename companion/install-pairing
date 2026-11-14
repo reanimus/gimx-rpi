@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+# No package download or compilation needed: the image contains the QEMU-tested static binary.
+modinfo raw_gadget >/dev/null
+systemctl daemon-reload
+systemctl enable --now gimx-pairing.service
